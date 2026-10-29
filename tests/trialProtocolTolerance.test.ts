@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { parsePlanProtocol } from '../src/core/protocol/planProtocol';
-import { ManagerProtocolSchema } from '../src/core/types/protocols';
+import { MAX_PLAN_TASKS, ManagerProtocolSchema } from '../src/core/types/protocols';
 
 /**
  * #268: what the first real trial (2026-10-25) showed. Claude Code (sonnet)
@@ -30,6 +30,14 @@ describe('protocol tolerance found in the first real trial (#268)', () => {
     expect(parsePlanProtocol(plan(' Critical ')).success).toBe(true);
     expect(parsePlanProtocol(plan('urgent')).success).toBe(false);
     expect(parsePlanProtocol(plan(3)).success).toBe(false);
+  });
+
+  it('accepts a plan of up to 60 tasks for a project planned from several milestones (#334)', () => {
+    const plan = (count: number) => JSON.stringify({ protocol: 'plan.v1', message_id: 'm', project_id: 'p', contract_sha256: 'a'.repeat(64),
+      tasks: Array.from({ length: count }, (_, index) => ({ title: `Task ${index + 1}`, acceptance_criteria: ['done'] })) });
+    expect(parsePlanProtocol(plan(21)).success).toBe(true);
+    expect(parsePlanProtocol(plan(MAX_PLAN_TASKS)).success).toBe(true);
+    expect(parsePlanProtocol(plan(MAX_PLAN_TASKS + 1))).toMatchObject({ success: false, reasonCode: 'PLAN_PROTOCOL_INVALID' });
   });
 
   it('applies the same case tolerance to manager.v1 priority and risk', () => {
