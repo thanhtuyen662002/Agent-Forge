@@ -3,7 +3,7 @@ import { Repository } from '../database/repositories';
 import { EventService } from './EventService';
 import { ProviderRegistry } from '../adapters/ProviderRegistry';
 import { RoleAwareRoutingService } from './RoleAwareRoutingService';
-import { TaskService, captureAuthorizedTaskTransitionBinding } from './TaskService';
+import { OWNER_TASK_RETRIED_EVENT, TaskService, captureAuthorizedTaskTransitionBinding } from './TaskService';
 import { ProjectStopFenceService } from './ProjectStopFenceService';
 import { WorkerSlotLeaseService } from './WorkerSlotLeaseService';
 import { ProtocolParser } from '../protocol/parser';
@@ -192,8 +192,12 @@ export class ProductManagerService {
   /** Events of the task's current revision; for the planning anchor, only those for the current contract. */
   private eventsForRevision(task: Task) {
     const planHash = this.isPlanningAnchor(task) ? this.currentContractHash(task.project_id) : undefined;
+    // An owner retry of the revision (#318, #328) starts a fresh round of Manager decisions.
+    const retried = this.repo.getProjectEventsOfTypes(task.project_id, [OWNER_TASK_RETRIED_EVENT], task.id)
+      .find((event) => (event.structured_payload as { revision?: unknown } | null)?.revision === task.revision_count)?.timestamp ?? '';
     return this.managerEvents(task.project_id, task.id)
       .filter((event) => (event.structured_payload as { taskRevision?: unknown } | null)?.taskRevision === task.revision_count)
+      .filter((event) => event.timestamp > retried)
       .filter((event) => planHash === undefined || (event.structured_payload as { contractSha256?: unknown } | null)?.contractSha256 === planHash)
       .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
   }

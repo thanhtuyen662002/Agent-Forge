@@ -332,6 +332,8 @@ export class TaskService {
    *   revision that failed.
    * - CODING with failed coder runs and none live (the per-account retry bounds
    *   stop it silently): coder failures settled before the retry stop counting.
+   * - BLOCKED (the Manager stopped it, for example because the coder lacked files,
+   *   #328): CLEAR_BLOCKED returns it to CODING, and the Manager is asked again.
    */
   public retryTask(projectId: string, taskId: string, extraRevisions = OWNER_RETRY_EXTRA_REVISIONS):
     { success: true; task: Task } | { success: false; errorCode: string; error: string } {
@@ -353,6 +355,14 @@ export class TaskService {
             `The owner retried task ${taskId} at revision ${task.revision_count}; earlier coder failures no longer count.`,
             { taskId, revision: task.revision_count, maxRevisions: task.max_revisions }, taskId);
           return { success: true as const, task };
+        }
+        if (task.state === 'BLOCKED') {
+          const cleared = this.transitionAuthorizedTask(taskId, 'CLEAR_BLOCKED', captureAuthorizedTaskTransitionBinding(task));
+          if (!cleared.success) throw new OwnerRetryError(cleared.errorCode ?? 'TASK_TRANSITION_FAILED');
+          this.eventService.record(projectId, OWNER_TASK_RETRIED_EVENT,
+            `The owner retried blocked task ${taskId} at revision ${task.revision_count}; the Manager decides again.`,
+            { taskId, revision: task.revision_count, maxRevisions: task.max_revisions }, taskId);
+          return { success: true as const, task: this.repo.getTask(taskId)! };
         }
         if (task.state !== 'NEEDS_HUMAN') throw new OwnerRetryError('TASK_NOT_RETRYABLE');
         const maxRevisions = task.revision_count + extraRevisions;

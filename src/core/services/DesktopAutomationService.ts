@@ -14,6 +14,7 @@ import { WorkerSlotLeaseService } from './WorkerSlotLeaseService';
 import { resolveTrustedExecutable } from './ExecutableResolver';
 import { GitService } from './GitService';
 import { OWNER_TASK_RETRIED_EVENT, TaskService } from './TaskService';
+import { widenTaskContext } from './TaskContextWidening';
 import { VerificationService } from './VerificationService';
 import { AutomatedVerificationService, VERIFICATION_FAILED_EVENT, VERIFICATION_PASSED_EVENT, VERIFICATION_SKIPPED_EVENT } from './AutomatedVerificationService';
 import { ProductReviewService, type ReviewerCandidate } from './ProductReviewService';
@@ -774,6 +775,7 @@ export class DesktopAutomationService {
         // by settlement and recovery.
         releaseUnclaimed();
         fail(result.status, result.errorCode ? String(result.errorCode) : undefined, Boolean(this.repo.getExecutionAuthorization(auth.id)?.settled_at));
+        this.widenAfterOutOfScope(project.id, task.id, auth.id);
         return;
       }
       this.lastFailure.delete(task.id);
@@ -787,6 +789,22 @@ export class DesktopAutomationService {
       const message = error instanceof Error ? error.message : '';
       const code = /^([A-Z_]+):/.exec(message.replace(/^EXECUTION_AUTHORIZATION_FAILED:\s*/, ''))?.[1] ?? 'PREPARATION_FAILED';
       fail(code);
+    }
+  }
+
+  /**
+   * A run refused because the coder wrote an existing repository file outside its context
+   * (VidFlow M1: src/migrations.ts) gets that file into the task's context for the next run (#328).
+   */
+  private widenAfterOutOfScope(projectId: string, taskId: string, authorizationId: string): void {
+    const failed = this.repo.getProjectEventsOfTypes(projectId, ['PRODUCT_EXECUTION_FAILED'], taskId)
+      .find((event) => (event.structured_payload as { authorization_id?: unknown } | null)?.authorization_id === authorizationId);
+    const error = (failed?.structured_payload as { result_payload?: { error?: unknown } } | undefined)?.result_payload?.error;
+    if (typeof error !== 'string' || !error.startsWith('WORKSPACE_SYNC_OUT_OF_SCOPE')) return;
+    const added = widenTaskContext(this.repo, projectId, taskId, [error]);
+    if (added.length > 0) {
+      this.eventService.record(projectId, 'AUTOMATION_CONTEXT_WIDENED',
+        `Task ${taskId} context now includes ${added.join(', ')}, which its coder needed to change.`, { authorizationId, added }, taskId);
     }
   }
 

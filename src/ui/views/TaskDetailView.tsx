@@ -71,7 +71,7 @@ export const TaskDetailView: React.FC = () => {
   }
 
   // NEEDS_HUMAN, or a coding task automation reports as failed: its coder retries ran out (#318).
-  const retryable = task.state === 'NEEDS_HUMAN' || (task.state === 'CODING' && (automationStatus?.projects ?? [])
+  const retryable = task.state === 'NEEDS_HUMAN' || task.state === 'BLOCKED' || (task.state === 'CODING' && (automationStatus?.projects ?? [])
     .some((entry) => entry.projectId === task.project_id && entry.taskId === task.id && entry.phase === 'FAILED'));
 
   const handleRetry = async () => {
@@ -143,7 +143,7 @@ export const TaskDetailView: React.FC = () => {
               <AlertTriangle className="w-4 h-4" />
               <span>{t('taskDetail.retryTitle')}</span>
             </h3>
-            <p className="text-xs text-slate-300">{task.state === 'NEEDS_HUMAN' ? t('taskDetail.retryHint', { count: OWNER_RETRY_REVISIONS }) : t('taskDetail.retryCoderHint')}</p>
+            <p className="text-xs text-slate-300">{task.state === 'NEEDS_HUMAN' ? t('taskDetail.retryHint', { count: OWNER_RETRY_REVISIONS }) : task.state === 'BLOCKED' ? t('taskDetail.retryBlockedHint') : t('taskDetail.retryCoderHint')}</p>
             {retryError && <p role="alert" className="text-xs text-red-300">{t('taskDetail.retryFailed', { code: retryError })}</p>}
           </div>
           <button
