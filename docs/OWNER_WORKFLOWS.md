@@ -500,6 +500,23 @@ the coder**. Coder failures settled before the retry stop counting, so
 automation dispatches the task again. A task with a live or completed run
 cannot be retried this way.
 
+**Files a failure names join the task (#328).** A coder sees and changes
+only its task's context paths, so it cannot see a failing test or a caller in
+another file. In VidFlow M1 that cost tasks every revision. Agent Forge now adds
+existing repository files to the task's context for the next run when they are
+named by any of these:
+- a failed test run, such as `test at test\cli-ref.test.ts:28`;
+- the coder's blockers, such as "the workspace is missing src/migrations.ts";
+- a run refused because the coder wrote an existing file outside its context
+  (`WORKSPACE_SYNC_OUT_OF_SCOPE`).
+
+Each failure adds at most 8 files, checked like planned context paths. Paths
+that leave the repository, `node_modules` and `.git` are never added. A
+task without explicit context paths is left alone. Additions are recorded as
+`contextAdded` on the verification failure, or as `AUTOMATION_CONTEXT_WIDENED`.
+**Retry** now also works for a task the Manager `BLOCK`ed. It returns the task
+to `CODING`, and the Manager decides again.
+
 **Truthful progress and coder failover (#302).** Automated tasks also refresh
 their progress whenever a coder run of the current revision starts, settles or
 fails. The stages are:

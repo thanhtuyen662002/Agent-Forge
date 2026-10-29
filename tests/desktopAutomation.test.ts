@@ -841,6 +841,25 @@ describe('desktop automation runtime', () => {
       expect(managerPrompt()).toContain('This is revision 1 of 4.');
     }, 120_000);
 
+    it('retries a task the Manager blocked and asks the Manager again (#328)', async () => {
+      reviewReply = verdict('FIX_REQUIRED');
+      const { task } = await runToReview();
+      addManager();
+      managerReply = (request) => ({ executionId: request.runtimeBinding!.executionId!, status: 'COMPLETED', outputProtocol: JSON.stringify({
+        protocol: 'manager.v1', message_id: `m-${crypto.randomUUID()}`, project_id: projectId, task_id: request.taskId, decision: 'BLOCK',
+        instructions: ['The coder lacks src/cli.ts'], expected_task_state: 'CODING', expected_revision: repo.getTask(request.taskId)!.revision_count }) });
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      await service.tick();
+      await service.drain();
+      expect(repo.getTask(task.id)!.state).toBe('BLOCKED');
+      expect(managerRequests).toHaveLength(1);
+
+      expect(tasks.retryTask(projectId, task.id)).toMatchObject({ success: true, task: { state: 'CODING', revision_count: 1 } });
+      await service.tick();
+      await service.drain();
+      expect(managerRequests).toHaveLength(2); // A fresh decision after the owner's retry.
+    }, 120_000);
+
     it('never retries a trashed NEEDS_HUMAN task or changes it when a step fails (#318)', async () => {
       reviewReply = verdict('FIX_REQUIRED');
       const { task } = await runToReview((taskId) => { db.prepare('UPDATE tasks SET max_revisions = 1 WHERE id = ?').run(taskId); });

@@ -1,4 +1,5 @@
 import { Repository } from '../database/repositories';
+import { widenTaskContext } from './TaskContextWidening';
 import { EventService } from './EventService';
 import { TaskService, captureAuthorizedTaskTransitionBinding } from './TaskService';
 import { VerificationService } from './VerificationService';
@@ -122,9 +123,10 @@ export class AutomatedVerificationService {
     const report = this.coderReport(auth);
     if (report && (report.status === 'BLOCKED' || report.status === 'FAILED')) {
       const reasonCode = `CODER_${report.status}`;
+      const contextAdded = widenTaskContext(this.repo, auth.project_id, auth.task_id, report.blockers);
       this.transition(task.id, 'TESTS_FAILED');
       this.record(auth, VERIFICATION_FAILED_EVENT, `Automated verification of task ${task.id} did not run: the coder reported ${report.status}.`, {
-        reasonCode, blockers: report.blockers, testRunId: null, worktree,
+        reasonCode, blockers: report.blockers, contextAdded, testRunId: null, worktree,
         headSha: before.headSha, snapshotSha: before.snapshotSha, changedFiles: before.changedFiles,
       });
       return { outcome: 'FAILED', reasonCode, testRunId: null };
@@ -154,9 +156,12 @@ export class AutomatedVerificationService {
       return { outcome: 'PASSED', testRunId: testRunId! };
     }
     // A failure, an unrunnable command or a rejected transition never becomes success.
+    const run = testRunId ? this.repo.getTestRun(testRunId) : null;
+    const output = run?.evidence_id ? this.repo.getEvidenceById(run.evidence_id)?.raw_payload ?? '' : '';
+    const contextAdded = widenTaskContext(this.repo, auth.project_id, auth.task_id, [output]);
     this.transition(task.id, 'TESTS_FAILED');
     this.record(auth, VERIFICATION_FAILED_EVENT, `Automated verification failed for task ${task.id}: ${reasonCode}.`,
-      { reasonCode, testRunId, worktree, ...evidence });
+      { reasonCode, testRunId, worktree, contextAdded, ...evidence });
     return { outcome: 'FAILED', reasonCode, testRunId };
   }
 
