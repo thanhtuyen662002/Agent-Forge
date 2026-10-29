@@ -788,6 +788,34 @@ describe('desktop automation runtime', () => {
       expect(repo.getReviewsByTask(task.id)[0].verdict).toBe('FIX_REQUIRED');
     }, 120_000);
 
+    it('lets the owner retry a NEEDS_HUMAN task with more revisions, and the Manager reads why it failed (#318)', async () => {
+      reviewReply = verdict('FIX_REQUIRED');
+      const { task } = await runToReview((taskId) => { db.prepare('UPDATE tasks SET max_revisions = 1 WHERE id = ?').run(taskId); });
+      const stuck = repo.getTask(task.id)!;
+      expect(stuck).toMatchObject({ state: 'NEEDS_HUMAN', revision_count: 1, max_revisions: 1 });
+      expect(tasks.retryNeedsHumanTask('PROJ-OTHER', task.id)).toMatchObject({ success: false, errorCode: 'TASK_NOT_FOUND' });
+
+      const retried = tasks.retryNeedsHumanTask(projectId, task.id);
+      expect(retried).toMatchObject({ success: true, task: { state: 'CODING', revision_count: 1, max_revisions: 4 } });
+      expect(repo.getEventsByProject(projectId).filter((e) => e.type === 'OWNER_TASK_RETRIED')).toHaveLength(1);
+      expect(tasks.retryNeedsHumanTask(projectId, task.id)).toMatchObject({ success: false, errorCode: 'TASK_NOT_NEEDS_HUMAN' });
+
+      addManager();
+      await service.tick();
+      await service.drain();
+      expect(managerPrompt()).toContain('Review of revision 0 (FIX_REQUIRED): Synthetic review');
+      expect(managerPrompt()).toContain('This is revision 1 of 4.');
+    }, 120_000);
+
+    it('never retries a trashed NEEDS_HUMAN task or changes it when a step fails (#318)', async () => {
+      reviewReply = verdict('FIX_REQUIRED');
+      const { task } = await runToReview((taskId) => { db.prepare('UPDATE tasks SET max_revisions = 1 WHERE id = ?').run(taskId); });
+      expect(tasks.retryNeedsHumanTask(projectId, task.id, 0)).toMatchObject({ success: false, errorCode: 'RETRY_REVISIONS_INVALID' });
+      db.prepare('UPDATE tasks SET ownership_epoch = 0 WHERE id = ?').run(task.id); // An invalid epoch makes the transition binding fail.
+      expect(tasks.retryNeedsHumanTask(projectId, task.id)).toMatchObject({ success: false });
+      expect(repo.getTask(task.id)).toMatchObject({ state: 'NEEDS_HUMAN', max_revisions: 1 }); // Rolled back.
+    }, 120_000);
+
     it('does not apply a verdict when the project is stopped while the reviewer runs', async () => {
       const pass = verdict('PASS');
       reviewReply = (request) => {

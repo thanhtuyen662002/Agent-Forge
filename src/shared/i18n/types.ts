@@ -217,6 +217,10 @@ export interface TranslationDictionary {
     runnerSubtitle: string;
     runTestsButton: string;
     runningTestsButton: string;
+    retryTitle: string;
+    retryHint: string;
+    retryButton: string;
+    retryFailed: string;
     noTaskSelected: string;
     testsComplete: string;
     testsFailed: string;

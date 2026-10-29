@@ -104,7 +104,7 @@ const isMcpCaller = (event: unknown): boolean => event === MCP_CALLER_EVENT;
 /** Channels an authenticated MCP caller may invoke; never credentials, sign-in, release or MCP settings. */
 export const MCP_INVOKABLE_CHANNELS: ReadonlySet<string> = new Set([
   'project:list', 'project:get', 'project:create', 'project:importContract', 'project:transition',
-  'task:list', 'task:get', 'task:create', 'events:list', 'agents:roster',
+  'task:list', 'task:get', 'task:create', 'task:retry', 'events:list', 'agents:roster',
   'verification:getCommands', 'verification:saveCommands',
   'automation:status', 'automation:managerDecisions', 'automation:setManagerMode', 'automation:decideManagerProposal',
   'automation:getParallelTasks', 'automation:setParallelTasks',
@@ -186,7 +186,7 @@ export function registerIpcHandlers(
   // project or task are refused before the handler runs; trashing also
   // invalidated its AUTHORIZED executions and dispatch re-checks the trash.
   const trashFencedChannels = new Set([
-    'project:importContract', 'project:transition', 'task:create', 'task:startReview', 'task:setContextPaths',
+    'project:importContract', 'project:transition', 'task:create', 'task:retry', 'task:startReview', 'task:setContextPaths',
     'protocol:generateWorkOrder', 'protocol:generateReviewPackage', 'verification:runTests',
     'verification:saveCommands', 'routing:routeTask', 'routing:authorizeTask',
     'routing:dispatchAuthorization', 'routing:generateAuthorizedWorkOrder',
@@ -1051,6 +1051,14 @@ export function registerIpcHandlers(
     repo.setProjectParallelTasks(projectId, count);
     void runtime.automation?.tick();
     return { success: true, parallelTasks: count };
+  });
+  // Owner retry of a NEEDS_HUMAN task with more revisions (#318).
+  registerPrivilegedHandler('task:retry', async (_, payload: unknown) => {
+    const target = readIntegrationTarget(payload);
+    if (!target) return { success: false, errorCode: 'TASK_NOT_FOUND' };
+    const result = taskService.retryNeedsHumanTask(target.projectId, target.taskId);
+    if (result.success) void runtime.automation?.tick();
+    return sanitizeOutputValue(result);
   });
   registerPrivilegedHandler('automation:decideManagerProposal', async (_, payload: unknown) => {
     const manager = runtime.automation?.getManager();

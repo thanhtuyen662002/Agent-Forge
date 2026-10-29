@@ -131,6 +131,13 @@ describe('local MCP server (#289)', () => {
     ]);
   });
 
+  it('retries a NEEDS_HUMAN task through the task:retry handler (#318)', async () => {
+    await server.setEnabled(true);
+    replies['task:retry'] = { success: true, task: { id: 'TSK-1', state: 'CODING' } };
+    expect((await call('retry_task', { projectId: 'PROJ-1', taskId: 'TSK-1' })).isError).toBe(false);
+    expect(calls).toEqual([{ channel: 'task:retry', payload: { projectId: 'PROJ-1', taskId: 'TSK-1' } }]);
+  });
+
   it('reports refusals and bad input as tool errors, never as success', async () => {
     await server.setEnabled(true);
     const badPath = await call('create_project', { name: 'Demo', repositoryPath: 'C:/Windows' });

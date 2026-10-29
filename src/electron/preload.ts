@@ -197,6 +197,7 @@ const api: OrchestratorApi = {
   getTaskContextPaths: (projectId: string, taskId: string) => ipcRenderer.invoke('task:getContextPaths', { projectId, taskId }),
   setTaskContextPaths: (projectId: string, taskId: string, paths: string[]) => ipcRenderer.invoke('task:setContextPaths', { projectId, taskId, paths }),
   createTask: (data) => ipcRenderer.invoke('task:create', data),
+  retryTask: (projectId: string, taskId: string) => ipcRenderer.invoke('task:retry', { projectId, taskId }),
   startReview: (taskId: string, binding?: TaskMutationBindingInput) =>
     ipcRenderer.invoke('task:startReview', { taskId, ...(binding ?? {}) }),
 
