@@ -203,12 +203,18 @@ export type PlanTask = z.infer<typeof PlanTaskSchema>;
  * bound to the project and to the SHA-256 of the exact contract it planned;
  * parsed only by the automated planning path, never by the protocol inbox.
  */
+/**
+ * Tasks one plan may hold. 20 fit a single milestone (VidFlow M1 used 8); a project
+ * planned in one pass from several milestones needs more (#334).
+ */
+export const MAX_PLAN_TASKS = 60;
+
 export const PlanProtocolSchema = z.object({
   protocol: z.literal('plan.v1'),
   message_id: requiredProtocolString(),
   project_id: requiredProtocolString(),
   contract_sha256: z.string().regex(/^[0-9a-f]{64}$/i),
-  tasks: boundedArray(z.array(PlanTaskSchema).min(1), 20),
+  tasks: boundedArray(z.array(PlanTaskSchema).min(1), MAX_PLAN_TASKS),
   created_at: protocolString().optional(),
 });
 export type PlanProtocol = z.infer<typeof PlanProtocolSchema>;
