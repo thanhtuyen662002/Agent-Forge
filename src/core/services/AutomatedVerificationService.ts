@@ -1,5 +1,6 @@
 import { Repository } from '../database/repositories';
 import { widenTaskContext } from './TaskContextWidening';
+import { ensureProjectDependencies, validateVerificationEnv } from './ProjectVerificationEnvironment';
 import { EventService } from './EventService';
 import { TaskService, captureAuthorizedTaskTransitionBinding } from './TaskService';
 import { VerificationService } from './VerificationService';
@@ -13,6 +14,7 @@ import type { WorkOrder } from '../autonomy/contracts';
 export const VERIFICATION_PASSED_EVENT = 'AUTOMATION_VERIFICATION_PASSED';
 export const VERIFICATION_FAILED_EVENT = 'AUTOMATION_VERIFICATION_FAILED';
 export const VERIFICATION_SKIPPED_EVENT = 'AUTOMATION_VERIFICATION_NOT_RUN';
+const DEPENDENCY_RETRY_AFTER_MS = 10 * 60_000;
 
 export type AutomatedVerificationOutcome =
   | { outcome: 'PASSED'; testRunId: string }
@@ -35,7 +37,11 @@ export class AutomatedVerificationService {
     private readonly tasks: TaskService,
     private readonly verification: VerificationService,
     private readonly evidence: Pick<EvidenceCollector, 'collect'> = new EvidenceCollector(),
+    private readonly installDependencies: typeof ensureProjectDependencies = ensureProjectDependencies,
   ) {}
+
+  /** A failed dependency install is retried after this time, per project (#336). */
+  private readonly dependencyRetryAfter = new Map<string, number>();
 
   /**
    * Content identity of the coder's uncommitted work: HEAD stays at the base, so
@@ -111,6 +117,27 @@ export class AutomatedVerificationService {
     if (inspected.status !== 'INSPECTED' || !inspected.inspection.registered || !inspected.inspection.exists ||
         !inspected.inspection.sourceMatch || inspected.inspection.managedPath !== worktree) {
       return notRun('WORKTREE_NOT_VERIFIABLE');
+    }
+
+    // Locked npm dependencies, when the owner opted in (#336): installed beside the worktrees,
+    // never into one. An install failure is the environment's, not the coder's: nothing is
+    // recorded against the run, and it is verified again after a delay.
+    if (this.repo.getProjectInstallDependencies(project.id)) {
+      if ((this.dependencyRetryAfter.get(project.id) ?? 0) > Date.now()) return { outcome: 'NOT_RUN', reasonCode: 'DEPENDENCY_INSTALL_RETRY_PENDING' };
+      let env: Record<string, string> = {};
+      try { env = validateVerificationEnv(this.repo.getProjectVerificationEnv(project.id)); } catch { /* none */ }
+      const installed = await this.installDependencies(worktree, env);
+      if (installed.status === 'FAILED') {
+        this.dependencyRetryAfter.set(project.id, Date.now() + DEPENDENCY_RETRY_AFTER_MS);
+        this.events.record(project.id, 'AUTOMATION_DEPENDENCY_INSTALL_FAILED',
+          `Installing the locked dependencies for task ${task.id} failed (${installed.reasonCode}); verification retries later.`,
+          { authorizationId: auth.id, reasonCode: installed.reasonCode, lockSha256: installed.lockSha256 ?? null }, task.id);
+        return { outcome: 'NOT_RUN', reasonCode: installed.reasonCode };
+      }
+      if (installed.status === 'INSTALLED') {
+        this.events.record(project.id, 'AUTOMATION_DEPENDENCIES_INSTALLED',
+          `Installed the locked dependencies of project ${project.id} for verification.`, { lockSha256: installed.lockSha256 }, task.id);
+      }
     }
 
     const before = await this.snapshot(worktree, auth.repository_head_sha);

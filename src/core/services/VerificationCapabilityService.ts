@@ -11,6 +11,7 @@ import { captureRepositoryRoot, RepositoryRootError } from './RepositoryRootIden
 import { RepositoryRootLease } from './RepositoryRootLease';
 import { isProtectedExecutableName, resolveTrustedExecutable } from './ExecutableResolver';
 import { CommandParser } from './CommandParser';
+import { validateVerificationEnv } from './ProjectVerificationEnvironment';
 import {
   VerificationCapabilityError, VerificationCapabilityPayload, VerificationCapabilityPayloadSchema,
   VerificationCapabilityRecord, VerificationCapabilityReference, VerificationCapabilityReferenceSchema,
@@ -345,6 +346,11 @@ export class VerificationCapabilityService {
     } else {
       environment.PATH = '/usr/bin:/bin';
     }
+    // Owner-set project variables (#336), for example VIDFLOW_FFMPEG. A stored value that
+    // no longer validates is dropped as a whole rather than half-applied.
+    try {
+      Object.assign(environment, validateVerificationEnv(this.repo.getProjectVerificationEnv(projectId)));
+    } catch { /* invalid stored settings add nothing */ }
     const assertInvocation = (actualExecutable: string, actualArgs: string[], cwd: string) => {
       if (!samePath(canonicalPath(cwd, true).path, root)) throw new VerificationCapabilityError('CAPABILITY_BINDING_MISMATCH');
       if (canonicalPath(cwd, true).identity !== runtime.identity) throw new VerificationCapabilityError('PATH_IDENTITY_CHANGED');
