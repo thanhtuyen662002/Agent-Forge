@@ -98,6 +98,40 @@ export function redactSensitiveText(value: unknown, options?: { assignmentLabels
   return redacted;
 }
 
+/** Replaces one JSONL event that could not be sanitized; still a JSON object, so stream parsers keep working. */
+export const REDACTED_JSON_LINE = '{"type":"agent_forge.redacted","reason":"OUTPUT_REDACTION_UNSAFE"}';
+
+/**
+ * Line-level sanitization of a JSONL event stream (#326), or null when the text is
+ * not one. A compound credential assignment makes redactSensitiveText reject the
+ * whole text; in a stream whose every non-empty line is a JSON object, no value
+ * can span lines (newlines inside strings are escaped), so dropping only the
+ * unsafe events removes every member of such a value and keeps the rest (for
+ * example a coder's final report). Anything else still fails closed.
+ */
+export function redactJsonLines(value: string): string | null {
+  if (typeof value !== 'string' || value.length > OUTPUT_MAX_TEXT_CHARACTERS) return null;
+  const lines = value.split(/\r?\n/);
+  const safe: string[] = [];
+  for (const line of lines) {
+    if (line.trim() === '') { safe.push(''); continue; }
+    let parsed: unknown;
+    try { parsed = JSON.parse(line); } catch { return null; }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    try {
+      safe.push(redactSensitiveText(line));
+    } catch (error) {
+      if (!(error instanceof OutputSanitizationError) || error.code !== 'OUTPUT_REDACTION_UNSAFE') throw error;
+      safe.push(REDACTED_JSON_LINE);
+    }
+  }
+  try {
+    return redactSensitiveText(safe.join('\n'));
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Clone JSON-shaped output without invoking getters/toJSON. Object undefined
  * properties are omitted like JSON serialization; unsafe array/root values,

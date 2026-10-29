@@ -8,7 +8,7 @@ import { ArtifactStore } from './ArtifactStore';
 import { isIssuedVerificationProcessBoundary, VerificationInvocationLease, VerificationProcessBoundary } from '../types/verificationCapability';
 import { RepositoryRootError, RepositoryRootErrorCode, RepositoryRootIdentity } from './RepositoryRootIdentity';
 import { RepositoryRootLease } from './RepositoryRootLease';
-import { OutputSanitizationError, type OutputSanitizationErrorCode, redactSensitiveText } from '../../shared/security/secretRedaction';
+import { OutputSanitizationError, type OutputSanitizationErrorCode, redactJsonLines, redactSensitiveText } from '../../shared/security/secretRedaction';
 import {
   buildTrustedEnvironment,
   isProtectedExecutableName,
@@ -398,6 +398,21 @@ export class ProcessRunner {
 
   public static scrubSecrets(text: string): string {
     return redactSensitiveText(text);
+  }
+
+  /**
+   * Standard output may also be a JSONL event stream (Codex --json): an event
+   * the text redaction rejects is dropped alone instead of failing the run (#326).
+   */
+  public static scrubStdout(text: string): string {
+    try {
+      return redactSensitiveText(text);
+    } catch (error) {
+      if (!(error instanceof OutputSanitizationError) || error.code !== 'OUTPUT_REDACTION_UNSAFE') throw error;
+      const lines = redactJsonLines(text);
+      if (lines === null) throw error;
+      return lines;
+    }
   }
 
   /**
@@ -1045,7 +1060,7 @@ export class ProcessRunner {
             finalStderr = repositoryFailure.code;
           } else {
             try {
-              finalStdout = ProcessRunner.scrubSecrets(stdoutAcc);
+              finalStdout = ProcessRunner.scrubStdout(stdoutAcc);
               finalStderr = ProcessRunner.scrubSecrets(finalStderr);
             } catch (error) {
               const failure = error instanceof OutputSanitizationError
