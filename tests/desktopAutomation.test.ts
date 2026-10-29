@@ -732,6 +732,18 @@ describe('desktop automation runtime', () => {
       expect(after.revision_count).toBe(task.revision_count + 1);
     }, 60_000);
 
+    it('never cuts off a review that started after an old BLOCKED verdict (#332)', async () => {
+      const task = await approvedTask();
+      db.prepare("UPDATE tasks SET state = 'REVIEWING' WHERE id = ?").run(task.id);
+      events.record(projectId, 'AUTOMATION_REVIEW_BLOCKED', 'Automated review: BLOCKED.', { verdict: 'BLOCKED' }, task.id);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      events.record(projectId, 'AUTOMATION_REVIEW_STARTED', 'Automated review started.', {}, task.id);
+      service = reviewingService();
+      await service.tick();
+      await service.drain();
+      expect(repo.getTask(task.id)).toMatchObject({ state: 'REVIEWING', revision_count: task.revision_count });
+    }, 60_000);
+
     it('still sees an old verdict after more than 100 newer project events (#320)', async () => {
       const task = await approvedTask();
       db.prepare("UPDATE tasks SET state = 'REVIEWING' WHERE id = ?").run(task.id);
