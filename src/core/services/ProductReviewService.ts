@@ -356,8 +356,13 @@ export class ProductReviewService {
     let released = 0;
     for (const project of this.repo.getAllProjects()) {
       if (project.status !== 'RUNNING' || this.repo.isProjectTrashed(project.id)) continue;
+      const events = this.reviewEvents(project.id);
       for (const task of this.repo.getTasksByProject(project.id)) {
-        if (task.state !== 'REVIEWING' || this.repo.isTaskTrashed(task.id) || this.reviewReason(task) !== 'REVIEW_BLOCKED') continue;
+        if (task.state !== 'REVIEWING' || this.repo.isTaskTrashed(task.id)) continue;
+        // Only when the BLOCKED verdict is the task's latest review event: a review started
+        // after it is in flight and must not be cut off (#332, VidFlow M1).
+        const latest = events.filter((event) => event.task_id === task.id).sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0];
+        if (latest?.type !== REVIEW_BLOCKED_EVENT) continue;
         if (this.transition(task.id, task.revision_count >= task.max_revisions ? 'MAX_REVISIONS_EXCEEDED' : 'FIX_VERDICT')) released += 1;
       }
     }
