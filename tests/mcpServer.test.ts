@@ -138,6 +138,14 @@ describe('local MCP server (#289)', () => {
     expect(calls).toEqual([{ channel: 'task:retry', payload: { projectId: 'PROJ-1', taskId: 'TSK-1' } }]);
   });
 
+  it('configures the verification environment through the existing handler (#336)', async () => {
+    await server.setEnabled(true);
+    replies['verification:setEnvironment'] = { success: true, env: { VIDFLOW_FFMPEG: 'C:/ffmpeg.exe' }, installDependencies: true };
+    expect((await call('configure_verification', { projectId: 'PROJ-1', installDependencies: true, env: { VIDFLOW_FFMPEG: 'C:/ffmpeg.exe' } })).isError).toBe(false);
+    expect(calls).toEqual([{ channel: 'verification:setEnvironment',
+      payload: { projectId: 'PROJ-1', installDependencies: true, env: { VIDFLOW_FFMPEG: 'C:/ffmpeg.exe' } } }]);
+  });
+
   it('reads and sets a task context through the existing handlers (#324)', async () => {
     await server.setEnabled(true);
     replies['task:getContextPaths'] = { success: true, paths: ['src/paths.ts'] };

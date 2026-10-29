@@ -1,4 +1,5 @@
 import { RepositoryRootLease } from '../core/services/RepositoryRootLease';
+import { validateVerificationEnv, VerificationEnvironmentError } from '../core/services/ProjectVerificationEnvironment';
 import type { Evidence } from '../core/types/domain';
 import { OutputSanitizationError, redactSensitiveText, sanitizeOutputValue } from '../shared/security/secretRedaction';
 import { sanitizeErrorDiagnostics, sanitizedDiagnosticError } from '../shared/security/outputDiagnostics';
@@ -107,7 +108,7 @@ export const MCP_INVOKABLE_CHANNELS: ReadonlySet<string> = new Set([
   'task:list', 'task:get', 'task:create', 'task:retry', 'task:getContextPaths', 'task:setContextPaths', 'events:list', 'agents:roster',
   'verification:getCommands', 'verification:saveCommands',
   'automation:status', 'automation:managerDecisions', 'automation:setManagerMode', 'automation:decideManagerProposal',
-  'automation:getParallelTasks', 'automation:setParallelTasks',
+  'automation:getParallelTasks', 'automation:setParallelTasks', 'verification:getEnvironment', 'verification:setEnvironment',
   'integration:list', 'integration:getAuto', 'integration:setAuto', 'integration:merge',
   'control:resume',
 ]);
@@ -1043,6 +1044,27 @@ export function registerIpcHandlers(
     repo.setProjectManagerMode(projectId, mode);
     void runtime.automation?.tick();
     return { success: true, mode };
+  });
+  // Project verification environment (#336): owner-set variables and locked dependency installs.
+  registerPrivilegedHandler('verification:getEnvironment', async (_, payload: unknown) => {
+    const projectId = readProjectId(payload);
+    if (!projectId) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
+    return { success: true, env: repo.getProjectVerificationEnv(projectId), installDependencies: repo.getProjectInstallDependencies(projectId) };
+  });
+  registerPrivilegedHandler('verification:setEnvironment', async (_, payload: unknown) => {
+    const projectId = readProjectId(payload);
+    if (!projectId) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
+    const body = payload as { env?: unknown; installDependencies?: unknown };
+    if (body.installDependencies !== undefined && typeof body.installDependencies !== 'boolean') return { success: false, errorCode: 'INVALID_INPUT' };
+    let env: Record<string, string> | undefined;
+    if (body.env !== undefined) {
+      try { env = validateVerificationEnv(body.env); } catch (error) {
+        return { success: false, errorCode: 'VERIFICATION_ENV_INVALID', name: error instanceof VerificationEnvironmentError ? error.name_ : null };
+      }
+    }
+    if (env) repo.setProjectVerificationEnv(projectId, env);
+    if (typeof body.installDependencies === 'boolean') repo.setProjectInstallDependencies(projectId, body.installDependencies);
+    return { success: true, env: repo.getProjectVerificationEnv(projectId), installDependencies: repo.getProjectInstallDependencies(projectId) };
   });
   // How many of the project's tasks coders work on at once (#306).
   registerPrivilegedHandler('automation:getParallelTasks', async (_, payload: unknown) => {
