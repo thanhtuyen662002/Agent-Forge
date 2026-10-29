@@ -450,7 +450,14 @@ export function registerIpcHandlers(
     const scoped = contextTask(parsed.data.projectId, parsed.data.taskId);
     if (!scoped) return { success: false, errorCode: 'TASK_NOT_FOUND' };
     const requested = parsed.data.paths.map((value) => value.trim()).filter(Boolean);
-    const check = validateContextPaths(scoped.project.repository_path, requested);
+    let check = validateContextPaths(scoped.project.repository_path, requested);
+    if (!check.ok && check.reasonCode === 'CONTEXT_PATH_MISSING') {
+      // A planned path the coder will create stays valid (#330); only a newly typed missing one is a typo.
+      const stored = new Set(repo.getTaskContextPaths(scoped.project.id, scoped.task.id).map((entry) => entry.toLowerCase()));
+      const lenient = validateContextPaths(scoped.project.repository_path, requested, { allowMissing: true });
+      const typed = lenient.ok ? (lenient.newPaths ?? []).find((entry) => !stored.has(entry.toLowerCase())) : undefined;
+      check = lenient.ok && typed !== undefined ? { ok: false, reasonCode: 'CONTEXT_PATH_MISSING', path: typed } : lenient;
+    }
     if (!check.ok) return { success: false, errorCode: check.reasonCode, path: check.path };
     repo.setTaskContextPaths(scoped.project.id, scoped.task.id, check.paths);
     return { success: true, paths: check.paths };

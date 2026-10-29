@@ -66,6 +66,14 @@ describe('task context path IPC', () => {
     expect(repo.setTaskContextPaths).not.toHaveBeenCalled();
   });
 
+  it('keeps a stored path the coder will create, but still refuses a newly typed missing one (#330)', async () => {
+    stored.set('P1/T1', ['README.md', 'src/feature/new.ts']); // Planned: the coder creates it.
+    await expect(call('task:setContextPaths', { projectId: 'P1', taskId: 'T1', paths: ['README.md', 'src/feature/new.ts', 'src/feature'] }))
+      .resolves.toEqual({ success: true, paths: ['README.md', 'src/feature/new.ts', 'src/feature'] });
+    await expect(call('task:setContextPaths', { projectId: 'P1', taskId: 'T1', paths: ['src/feature/new.ts', 'src/typo.ts'] }))
+      .resolves.toMatchObject({ success: false, errorCode: 'CONTEXT_PATH_MISSING', path: 'src/typo.ts' });
+  });
+
   it('refuses a task from another project, a trashed task and malformed input', async () => {
     await expect(call('task:setContextPaths', { projectId: 'P2', taskId: 'T1', paths: ['README.md'] })).resolves.toMatchObject({ success: false, errorCode: 'TASK_NOT_FOUND' });
     await expect(call('task:getContextPaths', { projectId: 'P2', taskId: 'T1' })).resolves.toMatchObject({ success: false, errorCode: 'TASK_NOT_FOUND' });
