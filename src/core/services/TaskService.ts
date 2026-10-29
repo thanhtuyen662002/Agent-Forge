@@ -291,7 +291,7 @@ export class TaskService {
     const hasLintConfig = this.repo.getVerificationCommandsByProject(task.project_id).some((c) => c.command_type === 'LINT' && c.enabled);
     // The automated path keeps the coder's changes uncommitted in the managed worktree;
     // a passed automated verification of that worktree is the evidence that they exist.
-    const taskEvents = this.repo.getEventsByProject(task.project_id).filter((event) => event.task_id === taskId);
+    const taskEvents = this.repo.getAllProjectEvents(task.project_id, taskId);
     const verifiedChanges = taskEvents.some((event) => event.type === 'AUTOMATION_VERIFICATION_PASSED');
     // Automated tasks report what their coder runs actually did (#302).
     const automated = taskEvents.some((event) => event.type.startsWith('AUTOMATION_'));

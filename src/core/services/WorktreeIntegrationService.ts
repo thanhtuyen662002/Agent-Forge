@@ -102,7 +102,7 @@ export class WorktreeIntegrationService {
 
   /** Reviewed work of the project and what the owner did with it. */
   public list(projectId: string): IntegrationEntry[] {
-    const projectEvents = this.repo.getEventsByProject(projectId);
+    const projectEvents = this.repo.getAllProjectEvents(projectId);
     const entries: IntegrationEntry[] = [];
     for (const task of this.repo.getTasksByProject(projectId)) {
       if (task.state !== 'DONE' || this.repo.isTaskTrashed(task.id)) continue;
@@ -159,7 +159,7 @@ export class WorktreeIntegrationService {
       const task = this.repo.getTask(taskId);
       const project = this.repo.getProjectMetadata(projectId);
       if (!task || !project || task.project_id !== projectId) return { success: false, errorCode: 'TASK_NOT_FOUND' };
-      const projectEvents = this.repo.getEventsByProject(projectId);
+      const projectEvents = this.repo.getAllProjectEvents(projectId);
       const work = this.reviewedWork(task, projectEvents);
       if (!work) return { success: false, errorCode: 'NO_REVIEWED_WORK' };
       const outcome = this.outcomeFor(projectEvents, task.id, work.reviewEventId);
@@ -258,7 +258,7 @@ export class WorktreeIntegrationService {
       const task = this.repo.getTask(taskId);
       if (!task || task.project_id !== projectId || this.repo.isTaskTrashed(taskId) || this.repo.isProjectTrashed(projectId)) return { success: false, errorCode: 'TASK_NOT_FOUND' };
       if (task.state !== 'DONE') return { success: false, errorCode: 'TASK_NOT_DONE' };
-      const projectEvents = this.repo.getEventsByProject(projectId);
+      const projectEvents = this.repo.getAllProjectEvents(projectId);
       const work = this.reviewedWork(task, projectEvents);
       if (!work) return { success: false, errorCode: 'NO_REVIEWED_WORK' };
       const outcome = this.outcomeFor(projectEvents, task.id, work.reviewEventId);
@@ -359,7 +359,7 @@ export class WorktreeIntegrationService {
       if (!TERMINAL_STATES.has(task.state)) return { success: false, errorCode: 'TASK_NOT_TERMINAL' };
       const worktrees = this.worktreesFor(projectId);
       if (!worktrees) return { success: false, errorCode: 'GIT_UNAVAILABLE' };
-      const projectEvents = this.repo.getEventsByProject(projectId);
+      const projectEvents = this.repo.getAllProjectEvents(projectId);
       const work = this.reviewedWork(task, projectEvents);
       const outcome = work ? this.outcomeFor(projectEvents, task.id, work.reviewEventId) : null;
       if (outcome?.type === INTEGRATION_DISCARDED_EVENT) return { success: false, errorCode: 'ALREADY_DISCARDED' };
