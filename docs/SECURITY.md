@@ -39,6 +39,9 @@ interface ProcessExecutionOptions {
 3. **Emergency Stop Hook**: All spawned processes register their PID in a tracked registry. Emergency Stop invokes process-tree termination.
 4. **Isolated verification profile (#314)**: Project test and lint commands never see the owner's profile. Each verification boundary gets its own fresh, empty profile under the temp directory: `USERPROFILE`, `HOME`, `APPDATA` and `LOCALAPPDATA` point there. That lets `os.homedir()` work, and the profile is removed, without following links, once the run ends.
 5. **CLI run limit**: A coder, reviewer or Manager CLI run is stopped after 20 minutes (`DEFAULT_CLI_RUN_TIMEOUT_MS`). The earlier 2-minute default cut off ordinary coding runs.
+6. **Project verification environment (#336)**: Two owner settings, set with MCP `configure_verification`, extend verification:
+   - **Variables:** at most 16 owner-set variables are added to the isolated verification environment, for example `VIDFLOW_FFMPEG`. Refused are names that steer the process or profile (`PATH`, `NODE_OPTIONS`, `USERPROFILE`, `APPDATA`, `NPM_CONFIG_*`, …), credential-like names (`*TOKEN*`, `*KEY*`, `*SECRET*`, …), values with line breaks, and values the secret redaction would change.
+   - **Locked dependencies:** when the owner opts in, `npm ci` installs the project's locked dependencies once per `package-lock.json` into `<managed root>/node_modules`, beside the worktrees and never inside one. The install runs in a private staging folder and replaces the previous tree only after it succeeds. An install failure is retried later and never counts against the coder.
 
 ---
 
