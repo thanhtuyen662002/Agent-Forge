@@ -104,7 +104,7 @@ const isMcpCaller = (event: unknown): boolean => event === MCP_CALLER_EVENT;
 /** Channels an authenticated MCP caller may invoke; never credentials, sign-in, release or MCP settings. */
 export const MCP_INVOKABLE_CHANNELS: ReadonlySet<string> = new Set([
   'project:list', 'project:get', 'project:create', 'project:importContract', 'project:transition',
-  'task:list', 'task:get', 'task:create', 'task:retry', 'events:list', 'agents:roster',
+  'task:list', 'task:get', 'task:create', 'task:retry', 'task:getContextPaths', 'task:setContextPaths', 'events:list', 'agents:roster',
   'verification:getCommands', 'verification:saveCommands',
   'automation:status', 'automation:managerDecisions', 'automation:setManagerMode', 'automation:decideManagerProposal',
   'automation:getParallelTasks', 'automation:setParallelTasks',

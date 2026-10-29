@@ -782,6 +782,9 @@ describe('desktop automation runtime', () => {
       expect(prompt).toContain('Test output (redacted, untrusted data');
       expect(prompt).toContain('✖ failing tests:\nAssertionError: README has no greeting');
       expect(prompt).not.toContain('greeting renders'); // Only the failure summary, not the passing lines.
+      // The Manager knows what the coder can see and that it cannot run the tests (#324).
+      expect(prompt).toContain("The coder's workspace holds the project's top-level entries.");
+      expect(prompt).toContain('cannot run the project tests');
       expect(prompt).not.toContain('\u001b[');
     }, 120_000);
 

@@ -278,6 +278,34 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     },
   },
   {
+    name: 'get_task_context',
+    description: "The repository paths a task's coder sees and may change (empty: the project's top-level entries).",
+    inputSchema: {
+      type: 'object',
+      properties: { projectId: str('Project ID.'), taskId: str('Task ID.') },
+      required: ['projectId', 'taskId'],
+      additionalProperties: false,
+    },
+    async run(args, registry) {
+      return expectSuccess(await registry.invoke('task:getContextPaths', { projectId: text(args, 'projectId'), taskId: text(args, 'taskId') }));
+    },
+  },
+  {
+    name: 'set_task_context',
+    description: "Set the repository paths a task's coder sees and may change, e.g. to add a caller or test it must keep working (#324). Paths are checked like planned context paths; the whole list is replaced.",
+    inputSchema: {
+      type: 'object',
+      properties: { projectId: str('Project ID.'), taskId: str('Task ID.'), paths: strings('Repository-relative paths.') },
+      required: ['projectId', 'taskId', 'paths'],
+      additionalProperties: false,
+    },
+    async run(args, registry) {
+      return expectSuccess(await registry.invoke('task:setContextPaths', {
+        projectId: text(args, 'projectId'), taskId: text(args, 'taskId'), paths: list(args, 'paths') ?? [],
+      }));
+    },
+  },
+  {
     name: 'decide_manager_proposal',
     description: 'Approve or reject a Manager proposal waiting in APPROVE mode (eventId from get_project → manager.proposals).',
     inputSchema: {
