@@ -741,6 +741,23 @@ export class ProductManagerService {
     return lines;
   }
 
+  /**
+   * What the coder can see (#324). In VidFlow M1 the Manager told the coder to fix a failing
+   * CLI test, but the coder's workspace held only src/paths.ts and its test: it could not see
+   * the caller that broke, nor run the suite, and spent its revisions guessing.
+   */
+  private coderWorkspace(task: Task): string[] {
+    const paths = this.repo.getTaskContextPaths(task.project_id, task.id);
+    return [
+      paths.length > 0
+        ? `The coder's workspace holds only these paths, and it may change only them: ${paths.join(', ')}.`
+        : "The coder's workspace holds the project's top-level entries.",
+      'The coder cannot read any other file and cannot run the project tests; Agent Forge runs them afterwards. ' +
+        'Give instructions it can carry out inside those paths: when a failing test or caller lives elsewhere, ' +
+        'quote what it expects from the test output and have the coder keep that behaviour compatible.',
+    ];
+  }
+
   /** What the Manager needs to decide: the task, the project goal and, for a new revision, what went wrong. */
   private instructions(task: Task, kind: PendingManagerDecision['kind']): string[] {
     const project: Project | null = this.repo.getProjectMetadata(task.project_id);
@@ -755,6 +772,7 @@ export class ProductManagerService {
     if (kind === 'NEXT_REVISION') {
       lines.push(`This is revision ${task.revision_count} of ${task.max_revisions}. The previous revision was sent back.`);
       lines.push(...this.previousRevisionResults(task));
+      lines.push(...this.coderWorkspace(task));
       lines.push('Tell the coder exactly what to fix in "instructions".');
       lines.push('Decision EXECUTE starts the coder with your instructions; BLOCK stops automation for this task and asks the owner.');
     } else {
