@@ -13,7 +13,7 @@ import { ConcurrentExecutionScheduler } from './ConcurrentExecutionScheduler';
 import { WorkerSlotLeaseService } from './WorkerSlotLeaseService';
 import { resolveTrustedExecutable } from './ExecutableResolver';
 import { GitService } from './GitService';
-import { TaskService } from './TaskService';
+import { OWNER_TASK_RETRIED_EVENT, TaskService } from './TaskService';
 import { VerificationService } from './VerificationService';
 import { AutomatedVerificationService, VERIFICATION_FAILED_EVENT, VERIFICATION_PASSED_EVENT, VERIFICATION_SKIPPED_EVENT } from './AutomatedVerificationService';
 import { ProductReviewService, type ReviewerCandidate } from './ProductReviewService';
@@ -346,7 +346,10 @@ export class DesktopAutomationService {
     }
     for (const task of authorized) {
       const failure = this.lastFailure.get(task.id);
-      if (failure && failure.revision === task.revision_count) return status('FAILED', task.id, failure.reasonCode);
+      const retriedAt = this.ownerRetriedAt(task);
+      if (failure && failure.revision === task.revision_count && !(retriedAt !== null && (failure.at ?? 0) <= retriedAt)) {
+        return status('FAILED', task.id, failure.reasonCode);
+      }
       if (this.settledForRevision(task) === 'FAILED') return status('FAILED', task.id, 'PROVIDER_EXECUTION_FAILED');
     }
     const eligible = authorized.find((task) => this.isDispatchable(task));
@@ -453,13 +456,14 @@ export class DesktopAutomationService {
   private isDispatchable(task: Task): boolean {
     const now = Date.parse(this.now());
     const failure = this.lastFailure.get(task.id);
-    if (failure && failure.revision === task.revision_count &&
+    const retriedAt = this.ownerRetriedAt(task);
+    if (failure && failure.revision === task.revision_count && !(retriedAt !== null && (failure.at ?? 0) <= retriedAt) &&
         ((failure.count ?? MAX_EXECUTIONS_PER_REVISION) >= MAX_EXECUTIONS_PER_REVISION || now - (failure.at ?? now) < EXECUTION_RETRY_AFTER_MS)) return false;
     const settled: string[] = [];
     for (const auth of this.repo.getExecutionAuthorizationsByTask(task.id)) {
       if (auth.status === 'AUTHORIZED') return false;
       if (auth.status === 'DISPATCHED' && !auth.settled_at) return false;
-      if (auth.task_revision === task.revision_count && auth.lifecycle_version === 1 && auth.settled_at) {
+      if (auth.task_revision === task.revision_count && auth.lifecycle_version === 1 && auth.settled_at && this.countsAfterRetry(auth, retriedAt)) {
         // A completed run goes on to verification and review; failed runs may be retried.
         if (auth.settlement_status === 'COMPLETED') return false;
         settled.push(String(auth.settled_at));
@@ -475,9 +479,10 @@ export class DesktopAutomationService {
   /** Failed settled runs of the task's current revision, per coder account (#302). */
   private failedRunsByAccount(task: Task): Map<string, number> {
     const failures = new Map<string, number>();
+    const retriedAt = this.ownerRetriedAt(task);
     for (const auth of this.repo.getExecutionAuthorizationsByTask(task.id)) {
       if (auth.task_revision !== task.revision_count || auth.lifecycle_version !== 1 || !auth.settled_at ||
-          auth.settlement_status === 'COMPLETED' || !auth.selected_account_id) continue;
+          auth.settlement_status === 'COMPLETED' || !auth.selected_account_id || !this.countsAfterRetry(auth, retriedAt)) continue;
       failures.set(auth.selected_account_id, (failures.get(auth.selected_account_id) ?? 0) + 1);
     }
     return failures;
@@ -509,10 +514,26 @@ export class DesktopAutomationService {
     }
   }
 
+  /**
+   * When the owner last retried the task at its current revision (#318), or null.
+   * Failed runs settled before it no longer count against the retry bounds.
+   */
+  private ownerRetriedAt(task: Task): number | null {
+    const retry = this.repo.getProjectEventsOfTypes(task.project_id, [OWNER_TASK_RETRIED_EVENT], task.id)
+      .find((event) => (event.structured_payload as { revision?: unknown } | null)?.revision === task.revision_count);
+    return retry ? Date.parse(retry.timestamp) : null;
+  }
+
+  private countsAfterRetry(auth: { settled_at?: string | null; settlement_status?: string | null }, retriedAt: number | null): boolean {
+    // A completed run always counts: its work goes on to verification and review.
+    return retriedAt === null || auth.settlement_status === 'COMPLETED' || Date.parse(String(auth.settled_at)) > retriedAt;
+  }
+
   private settledForRevision(task: Task): 'COMPLETED' | 'FAILED' | null {
+    const retriedAt = this.ownerRetriedAt(task);
     const settled = this.repo
       .getExecutionAuthorizationsByTask(task.id)
-      .filter((auth) => auth.task_revision === task.revision_count && auth.lifecycle_version === 1 && auth.settled_at)
+      .filter((auth) => auth.task_revision === task.revision_count && auth.lifecycle_version === 1 && auth.settled_at && this.countsAfterRetry(auth, retriedAt))
       .sort((a, b) => String(b.settled_at).localeCompare(String(a.settled_at)))[0];
     if (!settled) return null;
     return settled.settlement_status === 'COMPLETED' ? 'COMPLETED' : 'FAILED';

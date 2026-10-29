@@ -3,6 +3,7 @@ import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { ProgressIndicator } from '../components/ProgressIndicator';
 import { TaskContextEditor } from '../components/TaskContextEditor';
+import { useAutomationStatus } from '../runtimeStatus';
 import { UiActionResult, UiVerificationObservation, normalizeObservationResult, isVerificationObservation, uiActionFailure, uiActionFailureKey } from '../actionState';
 import {
   ArrowLeft,
@@ -17,6 +18,9 @@ import {
   Layers,
 } from 'lucide-react';
 
+/** Matches OWNER_RETRY_EXTRA_REVISIONS in TaskService (#318). */
+const OWNER_RETRY_REVISIONS = 3;
+
 export const TaskDetailView: React.FC = () => {
   const {
     tasks,
@@ -28,9 +32,13 @@ export const TaskDetailView: React.FC = () => {
     activeProject,
     isElectron,
     pendingActions,
+    refreshData,
   } = useOrchestrator();
 
   const { t } = useI18n();
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
+  const { status: automationStatus } = useAutomationStatus();
 
   const [isRunningTests, setIsRunningTests] = useState<boolean>(false);
   const [testResult, setTestResult] = useState<{ generation: number; result: UiActionResult<UiVerificationObservation> } | null>(null);
@@ -61,6 +69,26 @@ export const TaskDetailView: React.FC = () => {
       </div>
     );
   }
+
+  // NEEDS_HUMAN, or a coding task automation reports as failed: its coder retries ran out (#318).
+  const retryable = task.state === 'NEEDS_HUMAN' || (task.state === 'CODING' && (automationStatus?.projects ?? [])
+    .some((entry) => entry.projectId === task.project_id && entry.taskId === task.id && entry.phase === 'FAILED'));
+
+  const handleRetry = async () => {
+    const api = typeof window !== 'undefined' ? (window as any).orchestrator ?? null : null;
+    if (retrying || !api?.retryTask) return;
+    setRetrying(true);
+    setRetryError(null);
+    try {
+      const reply = await api.retryTask(task.project_id, task.id);
+      if (!reply?.success) setRetryError(String(reply?.errorCode ?? 'IPC_REJECTED'));
+      await refreshData();
+    } catch {
+      setRetryError('IPC_REJECTED');
+    } finally {
+      if (mounted.current) setRetrying(false);
+    }
+  };
 
   const handleRunTests = async () => {
     if (inFlight.current || running) return;
@@ -107,6 +135,26 @@ export const TaskDetailView: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {retryable && validTask && (
+        <div role="region" aria-label={t('taskDetail.retryTitle')} className="bg-amber-500/10 border border-amber-500/40 rounded-2xl p-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="space-y-1">
+            <h3 className="text-sm font-bold text-amber-300 flex items-center space-x-2">
+              <AlertTriangle className="w-4 h-4" />
+              <span>{t('taskDetail.retryTitle')}</span>
+            </h3>
+            <p className="text-xs text-slate-300">{task.state === 'NEEDS_HUMAN' ? t('taskDetail.retryHint', { count: OWNER_RETRY_REVISIONS }) : t('taskDetail.retryCoderHint')}</p>
+            {retryError && <p role="alert" className="text-xs text-red-300">{t('taskDetail.retryFailed', { code: retryError })}</p>}
+          </div>
+          <button
+            onClick={() => void handleRetry()}
+            disabled={retrying || !isElectron}
+            className="px-4 py-2 bg-amber-500/20 border border-amber-500/50 hover:bg-amber-500/30 text-amber-200 font-mono font-bold text-xs rounded-lg disabled:opacity-50 transition"
+          >
+            {task.state === 'NEEDS_HUMAN' ? t('taskDetail.retryButton', { count: OWNER_RETRY_REVISIONS }) : t('taskDetail.retryCoderButton')}
+          </button>
+        </div>
+      )}
 
       {/* Main Task Card */}
       <div className="bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl space-y-6">

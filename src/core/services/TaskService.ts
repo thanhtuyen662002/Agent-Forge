@@ -140,6 +140,17 @@ export function captureAuthorizedTaskTransitionBinding(task: Task): AuthorizedTa
   });
 }
 
+/** How many more revisions an owner retry of a NEEDS_HUMAN task allows (#318). */
+export const OWNER_RETRY_EXTRA_REVISIONS = 3;
+/** Recorded by an owner retry; coder failures settled before it no longer count (#318). */
+export const OWNER_TASK_RETRIED_EVENT = 'OWNER_TASK_RETRIED';
+
+class OwnerRetryError extends Error {
+  constructor(public readonly code: string) {
+    super(code);
+  }
+}
+
 class StaleTaskTransitionError extends Error {
   public readonly code = 'STALE_TASK_TRANSITION' as const;
   constructor(detail: string) {
@@ -310,6 +321,57 @@ export class TaskService {
       } : {}),
     });
     this.repo.updateTaskProgressCache(taskId, progress.percent);
+  }
+
+  /**
+   * Owner retry (#318), in one transaction (all or nothing):
+   * - NEEDS_HUMAN (all revisions used): the revision limit is raised by
+   *   `extraRevisions` and the task goes back to CODING at its current revision
+   *   through OWNER_RESOLVE and START_CODING. No Manager decision authorizes that
+   *   revision yet, so automation asks the Manager first, with the results of the
+   *   revision that failed.
+   * - CODING with failed coder runs and none live (the per-account retry bounds
+   *   stop it silently): coder failures settled before the retry stop counting.
+   */
+  public retryTask(projectId: string, taskId: string, extraRevisions = OWNER_RETRY_EXTRA_REVISIONS):
+    { success: true; task: Task } | { success: false; errorCode: string; error: string } {
+    if (!Number.isInteger(extraRevisions) || extraRevisions < 1 || extraRevisions > 10) {
+      return { success: false, errorCode: 'RETRY_REVISIONS_INVALID', error: 'RETRY_REVISIONS_INVALID: Between 1 and 10 more revisions.' };
+    }
+    try {
+      return this.repo.runInImmediateTransaction(() => {
+        const task = this.repo.getTask(taskId);
+        if (!task || task.project_id !== projectId) throw new OwnerRetryError('TASK_NOT_FOUND');
+        if (this.repo.isTaskTrashed(taskId) || this.repo.isProjectTrashed(projectId)) throw new OwnerRetryError('ENTITY_IN_TRASH');
+        if (task.state === 'CODING') {
+          const runs = this.repo.getExecutionAuthorizationsByTask(taskId).filter((auth) => auth.task_revision === task.revision_count);
+          const live = runs.some((auth) => auth.status === 'AUTHORIZED' || (auth.status === 'DISPATCHED' && !auth.settled_at));
+          const failed = runs.some((auth) => auth.lifecycle_version === 1 && auth.settled_at && auth.settlement_status !== 'COMPLETED');
+          const completed = runs.some((auth) => auth.lifecycle_version === 1 && auth.settlement_status === 'COMPLETED');
+          if (live || completed || !failed) throw new OwnerRetryError('TASK_NOT_RETRYABLE');
+          this.eventService.record(projectId, OWNER_TASK_RETRIED_EVENT,
+            `The owner retried task ${taskId} at revision ${task.revision_count}; earlier coder failures no longer count.`,
+            { taskId, revision: task.revision_count, maxRevisions: task.max_revisions }, taskId);
+          return { success: true as const, task };
+        }
+        if (task.state !== 'NEEDS_HUMAN') throw new OwnerRetryError('TASK_NOT_RETRYABLE');
+        const maxRevisions = task.revision_count + extraRevisions;
+        if (!this.repo.compareAndSwapTaskMaxRevisions(taskId, 'NEEDS_HUMAN', task.max_revisions, maxRevisions)) {
+          throw new OwnerRetryError('STALE_TASK_TRANSITION');
+        }
+        for (const trigger of ['OWNER_RESOLVE', 'START_CODING'] as const) {
+          const result = this.transitionAuthorizedTask(taskId, trigger, captureAuthorizedTaskTransitionBinding(this.repo.getTask(taskId)!));
+          if (!result.success) throw new OwnerRetryError(result.errorCode ?? 'TASK_TRANSITION_FAILED');
+        }
+        this.eventService.record(projectId, OWNER_TASK_RETRIED_EVENT,
+          `The owner retried task ${taskId} at revision ${task.revision_count} with ${extraRevisions} more revisions.`,
+          { taskId, revision: task.revision_count, previousMaxRevisions: task.max_revisions, maxRevisions }, taskId);
+        return { success: true as const, task: this.repo.getTask(taskId)! };
+      });
+    } catch (error) {
+      const code = error instanceof OwnerRetryError ? error.code : 'TASK_TRANSITION_FAILED';
+      return { success: false, errorCode: code, error: `${code}: ${error instanceof Error ? error.message : String(error)}` };
+    }
   }
 
   public createTask(spec: TaskCreationSpec): Task {

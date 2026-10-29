@@ -485,6 +485,21 @@ coder's own `coder.v1` report; only its `status` and `blockers` are used.
   A task already left in `REVIEWING` by a BLOCKED verdict from before the
   update is released the same way on the next automation tick (#310).
 
+**Retrying a task that needs you (#318).** A task that used all its revisions
+stops in `NEEDS_HUMAN`. The task page then shows **Retry with 3 more
+revisions**; external AI tools use the MCP tool `retry_task`. Retrying raises
+the revision limit by 3 and moves the task back to `CODING` at its current
+revision, through `OWNER_RESOLVE` and `START_CODING`. All steps run in one
+transaction and are recorded as `OWNER_TASK_RETRIED`. The Manager then decides
+the next attempt and first reads why the last revision failed.
+
+The same action handles a `CODING` task that automation shows as `FAILED`. This
+happens when every coder account used up its runs for that revision (in VidFlow
+M1, runs cut off by the old 2-minute timeout). The button then reads **Retry
+the coder**. Coder failures settled before the retry stop counting, so
+automation dispatches the task again. A task with a live or completed run
+cannot be retried this way.
+
 **Truthful progress and coder failover (#302).** Automated tasks also refresh
 their progress whenever a coder run of the current revision starts, settles or
 fails. The stages are:

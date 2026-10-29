@@ -265,6 +265,19 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     },
   },
   {
+    name: 'retry_task',
+    description: 'Retry a task in NEEDS_HUMAN (it used all its revisions) with 3 more revisions, or a CODING task whose coder runs all failed (automation phase FAILED); the Manager first reads why the last revision failed.',
+    inputSchema: {
+      type: 'object',
+      properties: { projectId: str('Project ID.'), taskId: str('Task ID.') },
+      required: ['projectId', 'taskId'],
+      additionalProperties: false,
+    },
+    async run(args, registry) {
+      return expectSuccess(await registry.invoke('task:retry', { projectId: text(args, 'projectId'), taskId: text(args, 'taskId') }));
+    },
+  },
+  {
     name: 'decide_manager_proposal',
     description: 'Approve or reject a Manager proposal waiting in APPROVE mode (eventId from get_project → manager.proposals).',
     inputSchema: {

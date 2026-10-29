@@ -628,6 +628,15 @@ export class Repository {
     return info.changes === 1;
   }
 
+  /** Raises the revision limit of a task still in the captured state and limit (#318). */
+  public compareAndSwapTaskMaxRevisions(taskId: string, expectedState: TaskState, expectedMaxRevisions: number, maxRevisions: number): boolean {
+    const info = this.db.prepare(`
+      UPDATE tasks SET max_revisions = ?, updated_at = ?
+      WHERE id = ? AND state = ? AND max_revisions = ?
+    `).run(maxRevisions, new Date().toISOString(), taskId, expectedState, expectedMaxRevisions);
+    return info.changes === 1;
+  }
+
   public updateTaskShas(id: string, baseSha?: string | null, currentSha?: string | null): void {
     const now = new Date().toISOString();
     this.db
