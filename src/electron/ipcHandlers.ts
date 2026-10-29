@@ -1054,17 +1054,26 @@ export function registerIpcHandlers(
   registerPrivilegedHandler('verification:setEnvironment', async (_, payload: unknown) => {
     const projectId = readProjectId(payload);
     if (!projectId) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
-    const body = payload as { env?: unknown; installDependencies?: unknown };
+    const body = payload as { env?: unknown; installDependencies?: unknown; testTimeoutSeconds?: unknown };
     if (body.installDependencies !== undefined && typeof body.installDependencies !== 'boolean') return { success: false, errorCode: 'INVALID_INPUT' };
+    // A project's test run may take longer than the 120 s default (#338); the authorization schema caps it at 600 s.
+    const timeout = body.testTimeoutSeconds;
+    if (timeout !== undefined && (typeof timeout !== 'number' || !Number.isInteger(timeout) || timeout < 10 || timeout > 600)) {
+      return { success: false, errorCode: 'TEST_TIMEOUT_INVALID' };
+    }
     let env: Record<string, string> | undefined;
     if (body.env !== undefined) {
       try { env = validateVerificationEnv(body.env); } catch (error) {
         return { success: false, errorCode: 'VERIFICATION_ENV_INVALID', name: error instanceof VerificationEnvironmentError ? error.name_ : null };
       }
     }
+    if (typeof timeout === 'number' && !repo.setVerificationCommandTimeout(projectId, 'TEST', timeout * 1000)) {
+      return { success: false, errorCode: 'VERIFICATION_NOT_CONFIGURED' };
+    }
     if (env) repo.setProjectVerificationEnv(projectId, env);
     if (typeof body.installDependencies === 'boolean') repo.setProjectInstallDependencies(projectId, body.installDependencies);
-    return { success: true, env: repo.getProjectVerificationEnv(projectId), installDependencies: repo.getProjectInstallDependencies(projectId) };
+    return { success: true, env: repo.getProjectVerificationEnv(projectId), installDependencies: repo.getProjectInstallDependencies(projectId),
+      testTimeoutSeconds: Math.round((repo.getVerificationCommandsByProject(projectId).find((command) => command.command_type === 'TEST')?.timeout_ms ?? 0) / 1000) || null };
   });
   // How many of the project's tasks coders work on at once (#306).
   registerPrivilegedHandler('automation:getParallelTasks', async (_, payload: unknown) => {

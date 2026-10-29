@@ -93,6 +93,17 @@ describe('issued capability process boundary', () => {
       policy: { timeout_ms: 10000, max_stdout_bytes: 4096, max_stderr_bytes: 4096, allowed_env_keys: ['AF_CAPABILITY_SENTINEL'] } };
   }
 
+  it('lets the owner set the test run limit without touching the approved command (#338)', async () => {
+    expect(repo.setVerificationCommandTimeout('P', 'TEST', 480_000)).toBe(false); // Nothing approved yet.
+    const { command } = await configured();
+    expect(repo.getVerificationCommandsByProject('P')[0].timeout_ms).toBe(120_000);
+    expect(repo.setVerificationCommandTimeout('P', 'TEST', 480_000)).toBe(true);
+    const [stored] = repo.getVerificationCommandsByProject('P');
+    expect(stored).toMatchObject({ timeout_ms: 480_000, executable: command.executable, args: command.args });
+    expect(buildVerificationCommandsSnapshot(repo.getVerificationCommandsByProject('P')).TEST?.timeout_ms).toBe(480_000);
+    for (const invalid of [0, 600_001, 1.5]) expect(() => repo.setVerificationCommandTimeout('P', 'TEST', invalid)).toThrow('TEST_TIMEOUT_INVALID');
+  });
+
   it('preserves capability identity in canonical snapshots and runs configured/frozen verification only while active', async () => {
     const { command, snapshot, verification } = await configured();
     const payload = authorize(snapshot);

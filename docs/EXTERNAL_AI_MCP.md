@@ -60,7 +60,7 @@ across restarts.
 | `integrate_reviewed_work` | Integrates one task's reviewed work now |
 | `decide_manager_proposal` | Approves or rejects a Manager proposal in `APPROVE` mode |
 | `get_task_context` / `set_task_context` | Reads or replaces the paths a task's coder sees and may change (#324) |
-| `configure_verification` | Installs locked npm dependencies for tests and sets plain test variables such as tool paths (#336) |
+| `configure_verification` | Installs locked npm dependencies for tests, sets plain test variables such as tool paths (#336), and the test run limit up to 600 s (#338) |
 | `retry_task` | Retries a `NEEDS_HUMAN` task with 3 more revisions, or a `CODING` task whose coder runs all failed (#318) |
 
 Every tool calls the same main-process handler as the desktop UI. Validation,

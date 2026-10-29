@@ -9430,6 +9430,13 @@ export class Repository {
       );
   }
 
+  /** Owner-set run limit of an approved command (#338); the command and its capability are unchanged. */
+  public setVerificationCommandTimeout(projectId: string, commandType: 'TEST' | 'LINT' | 'BUILD', timeoutMs: number): boolean {
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 600_000) throw new Error('TEST_TIMEOUT_INVALID');
+    return this.db.prepare('UPDATE verification_commands SET timeout_ms = ? WHERE project_id = ? AND command_type = ?')
+      .run(timeoutMs, projectId, commandType).changes === 1;
+  }
+
   public getVerificationCommandsByProject(projectId: string): any[] {
     const rows = this.db
       .prepare('SELECT * FROM verification_commands WHERE project_id = ? AND enabled = 1')
