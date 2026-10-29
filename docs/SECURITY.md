@@ -73,6 +73,10 @@ Agent-Forge guarantees:
    - Bearer Tokens & JWTs (`Bearer\s+[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*`)
    - Private Keys (`-----BEGIN (?:RSA )?PRIVATE KEY-----`)
    - Generic API Keys (`[a-zA-Z0-9_-]{32,}`)
+2a. **Compound credential values fail closed, except inside JSONL streams (#326).**
+   - **Why it fails closed:** a credential key assigned a `{...}` or `[...]` value has no structure that can be trusted. Redaction therefore rejects the whole text (`OUTPUT_REDACTION_UNSAFE`) instead of guessing where the value ends.
+   - **The exception:** a process's standard output can be a JSONL event stream, such as Codex `--json`. Each event is one JSON object per line, and newlines inside strings are escaped, so no value can span lines. In that case only the rejected event lines are replaced with `{"type":"agent_forge.redacted",...}`, and the rest is kept, including the coder's final report. The whole result is redacted once more.
+   - **Everything else** still fails closed: plain text, a non-object line, or a line that is not JSON.
 3. **Antigravity credential slots (#304).** agy keeps one machine-wide Google
    sign-in in the Windows Credential Manager (`gemini:antigravity`). To run
    several Antigravity accounts, Agent Forge copies that entry, as an opaque blob,
