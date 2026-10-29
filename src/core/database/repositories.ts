@@ -2008,6 +2008,27 @@ export class Repository {
     }));
   }
 
+  /**
+   * Every event of a project (optionally one task), newest first; unbounded. Automation
+   * derives state from events, and a recent-events window lost old facts (#320).
+   */
+  public getAllProjectEvents(projectId: string, taskId?: string): EventRecord[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM events WHERE project_id = ?${taskId ? ' AND task_id = ?' : ''} ORDER BY timestamp DESC`,
+    ).all(projectId, ...(taskId ? [taskId] : [])) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: String(r.id),
+      project_id: String(r.project_id),
+      task_id: r.task_id ? String(r.task_id) : null,
+      agent_id: r.agent_id ? String(r.agent_id) : null,
+      type: String(r.type),
+      summary: String(r.summary),
+      structured_payload: r.structured_payload_json ? JSON.parse(String(r.structured_payload_json)) : {},
+      timestamp: String(r.timestamp),
+    }));
+  }
+
+  /** The latest `limit` events of a project, for display; automation uses getAllProjectEvents or getProjectEventsOfTypes. */
   public getEventsByProject(projectId: string, limit: number = 100): EventRecord[] {
     return this.getEvents(projectId, limit);
   }

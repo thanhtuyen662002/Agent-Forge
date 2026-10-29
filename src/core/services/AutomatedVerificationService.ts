@@ -61,8 +61,7 @@ export class AutomatedVerificationService {
   }
 
   private eventsFor(auth: ExecutionAuthorization) {
-    return this.repo.getEventsByProject(auth.project_id).filter((event) =>
-      [VERIFICATION_PASSED_EVENT, VERIFICATION_FAILED_EVENT, VERIFICATION_SKIPPED_EVENT].includes(event.type) &&
+    return this.repo.getProjectEventsOfTypes(auth.project_id, [VERIFICATION_PASSED_EVENT, VERIFICATION_FAILED_EVENT, VERIFICATION_SKIPPED_EVENT]).filter((event) =>
       (event.structured_payload as { authorizationId?: unknown } | null)?.authorizationId === auth.id);
   }
 
@@ -163,8 +162,8 @@ export class AutomatedVerificationService {
 
   /** The coder.v1 report of the run, when the coder gave one; only its status and blockers are read. */
   private coderReport(auth: ExecutionAuthorization): { status: string; blockers: string[] } | null {
-    const settled = this.repo.getEventsByProject(auth.project_id).find((event) => event.task_id === auth.task_id &&
-      event.type === 'PRODUCT_EXECUTION_COMPLETED' && (event.structured_payload as { authorization_id?: unknown } | null)?.authorization_id === auth.id);
+    const settled = this.repo.getProjectEventsOfTypes(auth.project_id, ['PRODUCT_EXECUTION_COMPLETED'], auth.task_id).find((event) =>
+      (event.structured_payload as { authorization_id?: unknown } | null)?.authorization_id === auth.id);
     const payload = settled?.structured_payload as { result_payload?: { outputProtocol?: unknown } } | null | undefined;
     const text = payload?.result_payload?.outputProtocol;
     if (typeof text !== 'string') return null;

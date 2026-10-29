@@ -104,15 +104,14 @@ export class ProductReviewService {
   }
 
   private reviewEvents(projectId: string) {
-    return this.repo.getEventsByProject(projectId).filter((event) =>
-      event.type === REVIEW_STARTED_EVENT || REVIEW_TERMINAL_EVENTS.includes(event.type));
+    // Unbounded by type: a verdict must never fall out of a recent-events window (#320).
+    return this.repo.getProjectEventsOfTypes(projectId, [REVIEW_STARTED_EVENT, ...REVIEW_TERMINAL_EVENTS]);
   }
 
   /** The verified work a review of this task would be bound to, or null. */
   public verifiedWork(task: Task): VerifiedWork | null {
     if (task.state !== 'REVIEW_READY' || this.repo.isTaskTrashed(task.id)) return null;
-    const passed = this.repo.getEventsByProject(task.project_id)
-      .filter((event) => event.type === VERIFICATION_PASSED_EVENT && event.task_id === task.id)
+    const passed = this.repo.getProjectEventsOfTypes(task.project_id, [VERIFICATION_PASSED_EVENT], task.id)
       .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
     for (const event of passed) {
       const payload = (event.structured_payload ?? {}) as Record<string, unknown>;
@@ -429,7 +428,7 @@ export class ProductReviewService {
   }
 
   private reviewEventsFor(projectId: string, verificationEventId: string) {
-    return this.repo.getEventsByProject(projectId).filter((event) =>
+    return this.repo.getAllProjectEvents(projectId).filter((event) =>
       (event.structured_payload as { verificationEventId?: unknown } | null)?.verificationEventId === verificationEventId);
   }
 
