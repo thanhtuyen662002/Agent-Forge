@@ -138,6 +138,18 @@ describe('local MCP server (#289)', () => {
     expect(calls).toEqual([{ channel: 'task:retry', payload: { projectId: 'PROJ-1', taskId: 'TSK-1' } }]);
   });
 
+  it('reads and sets a task context through the existing handlers (#324)', async () => {
+    await server.setEnabled(true);
+    replies['task:getContextPaths'] = { success: true, paths: ['src/paths.ts'] };
+    replies['task:setContextPaths'] = { success: true, paths: ['src/paths.ts', 'src/cli.ts'] };
+    expect((await call('get_task_context', { projectId: 'PROJ-1', taskId: 'TSK-1' })).isError).toBe(false);
+    expect((await call('set_task_context', { projectId: 'PROJ-1', taskId: 'TSK-1', paths: ['src/paths.ts', 'src/cli.ts'] })).isError).toBe(false);
+    expect(calls).toEqual([
+      { channel: 'task:getContextPaths', payload: { projectId: 'PROJ-1', taskId: 'TSK-1' } },
+      { channel: 'task:setContextPaths', payload: { projectId: 'PROJ-1', taskId: 'TSK-1', paths: ['src/paths.ts', 'src/cli.ts'] } },
+    ]);
+  });
+
   it('reports refusals and bad input as tool errors, never as success', async () => {
     await server.setEnabled(true);
     const badPath = await call('create_project', { name: 'Demo', repositoryPath: 'C:/Windows' });
