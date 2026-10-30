@@ -340,7 +340,11 @@ export class DesktopAutomationService {
     const reviewReady = tasks.find((task) => task.state === 'REVIEW_READY' || task.state === 'REVIEWING');
     if (reviewReady) return status('AWAITING_REVIEW', reviewReady.id, this.awaitingReviewReason(reviewReady));
 
-    const authorized = this.authorizedTasks(project);
+    // One task at a time (#340): an earliest unfinished task that needs the owner holds every later one.
+    const first = this.isSequential(project) ? this.firstOpenTask(project) : null;
+    if (first && ['NEEDS_HUMAN', 'BLOCKED', 'FAILED'].includes(first.state)) return status('WAITING_FOR_MANAGER', first.id, 'EARLIER_TASK_NEEDS_OWNER');
+
+    const authorized = first ? this.authorizedTasks(project).filter((task) => task.id === first.id) : this.authorizedTasks(project);
     for (const task of authorized) {
       const settled = this.settledForRevision(task);
       if (settled === 'COMPLETED') return status('AWAITING_REVIEW', task.id, this.verificationReason(task.id) ?? 'NOT_VERIFIED');
@@ -450,7 +454,27 @@ export class DesktopAutomationService {
   private nextEligibleTask(project: Project): Task | null {
     // A task is never in two runs, even before its authorization exists (#306).
     const running = new Set([...this.inFlight.values()].filter((item) => item.kind === 'EXECUTION').map((item) => item.taskId));
+    if (this.isSequential(project)) {
+      // One task at a time on integrated code (#295) means the earliest unfinished task
+      // or nothing (#340). Found in VidFlow M2–M9: while one task waited for its review
+      // or its account lease, later tasks were dispatched on code without its changes.
+      const first = this.firstOpenTask(project);
+      return first && first.state === 'CODING' && !running.has(first.id) && managerAuthorizesRevision(this.repo, first) && this.isDispatchable(first)
+        ? first : null;
+    }
     return this.authorizedTasks(project).find((task) => !running.has(task.id) && this.isDispatchable(task)) ?? null;
+  }
+
+  /** One task at a time with automatic integration: the Manager plans for tasks that build on each other (#295). */
+  private isSequential(project: Project): boolean {
+    return this.repo.getProjectParallelTasks(project.id) <= 1 && this.repo.getProjectAutoIntegrate(project.id);
+  }
+
+  /** The earliest task in plan order that is not finished, or null when all are. */
+  private firstOpenTask(project: Project): Task | null {
+    const planningAnchor = this.repo.getProjectPlanningTaskId(project.id);
+    return this.repo.getTasksByProject(project.id).find((task) => task.id !== planningAnchor && !this.repo.isTaskTrashed(task.id) &&
+      task.state !== 'DONE' && task.state !== 'CANCELLED') ?? null;
   }
 
   /** Not already authorized, in flight, settled or failed for this exact revision. */
