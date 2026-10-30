@@ -141,6 +141,10 @@ export const TaskContextPathsIpcSchema = z.object({
 export const SetTaskContextPathsIpcSchema = TaskContextPathsIpcSchema.extend({
   paths: ipcStringArray(),
 });
+/** Tasks of the same project whose code this task needs (#362); the whole list is replaced. */
+export const SetTaskDependenciesIpcSchema = TaskContextPathsIpcSchema.extend({
+  dependsOn: ipcStringArray(),
+});
 
 const TaskMutationBindingIpcFields = {
   expectedRevision: z.number().int().min(0).max(1_000_000).optional(),

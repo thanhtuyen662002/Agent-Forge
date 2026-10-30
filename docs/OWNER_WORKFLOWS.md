@@ -601,8 +601,16 @@ recorded as `AUTH_ERROR` and is skipped until it is signed in again.
     (`NEEDS_HUMAN`, `BLOCKED`, `FAILED`), the status shows
     `EARLIER_TASK_NEEDS_OWNER` until it is retried or done.
   - **With N > 1,** up to N coder runs of different tasks run at once next to the
-    project's single lane (verification, review, integration, Manager). The
-    Manager is then told to plan self-contained tasks.
+    project's single lane (verification, review, integration, Manager).
+    - **Without automatic integration,** the Manager is told to plan self-contained tasks.
+    - **With automatic integration, task dependencies decide the order (#362).**
+      - The Manager lists for each planned task, in `depends_on`, the earlier tasks whose code it needs.
+      - A task is decided by the Manager only after its dependencies are done.
+      - A task is dispatched only after its dependencies are also integrated into the default branch, which every coder run starts from.
+      - Tasks without dependencies run in parallel, up to N.
+      - While the remaining tasks wait, the status shows `WAITING_FOR_DEPENDENCIES`.
+      - A cancelled or trashed dependency no longer holds back its dependents.
+    - **Editing dependencies.** The task detail view lists a task's dependencies. MCP edits them with `get_task_dependencies` / `set_task_dependencies`, which refuse unknown tasks and cycles.
   - **Separation.** Each run keeps its own attempt, authorization, lease, slot and
     worktree, and a task is never in two runs.
 - **Limits.**
