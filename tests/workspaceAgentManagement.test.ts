@@ -7,6 +7,7 @@ import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { BootstrapService } from '../src/core/services/BootstrapService';
 import { WorkspaceManagementService } from '../src/core/services/WorkspaceManagementService';
+import { insertFixtureRow } from './helpers/schemaRowFixture';
 
 const NOW = '2026-10-24T08:00:00.000Z';
 
@@ -249,5 +250,94 @@ describe('owner agent roster management', () => {
   it('reports unknown agents with a typed error', () => {
     expect(service.removeAgent({ agentId: 'missing' })).toMatchObject({ success: false, errorCode: 'AGENT_NOT_FOUND' });
     expect(service.removeAgent({})).toMatchObject({ success: false, errorCode: 'INVALID_INPUT' });
+    expect(service.purgeAgent({ agentId: 'missing' })).toMatchObject({ success: false, errorCode: 'AGENT_NOT_FOUND' });
+    expect(service.purgeAgent({ agentId: 'x', extra: true })).toMatchObject({ success: false, errorCode: 'INVALID_INPUT' });
+  });
+
+  describe('permanent delete of a removed agent (#344)', () => {
+    it('deletes the agent and its unused profile, keeps its account, resource and slots, and nulls history links', () => {
+      const result = createCodex();
+      if (!result.success) throw new Error('setup failed');
+      const id = result.agent.id;
+      const entry = service.listAgents().find((item) => item.agent.id === id)!;
+      repo.createProject({
+        id: 'P1', name: 'P', description: null, repository_path: path.join(dir, 'P1'), default_branch: 'main', status: 'PLANNING' as any,
+        contract: null, created_at: NOW, updated_at: NOW, started_at: null, completed_at: null,
+      });
+      db.prepare("INSERT INTO events (id, project_id, task_id, agent_id, type, summary, structured_payload_json, timestamp) VALUES ('E1', 'P1', NULL, ?, 'NOTE', 'x', '{}', ?)").run(id, NOW);
+      expect(service.removeAgent({ agentId: id }).success).toBe(true);
+
+      expect(service.purgeAgent({ agentId: id })).toEqual({ success: true, agentId: id });
+      expect(repo.getAgent(id)).toBeNull();
+      expect(repo.getAgentProfile(entry.agentProfile!.id)).toBeNull();
+      expect(repo.getProviderResource(entry.resource!.id)).not.toBeNull();
+      expect(repo.getProviderAccount(entry.account!.id)).not.toBeNull();
+      expect(repo.getWorkerSlotsByAccount(entry.account!.id)).toHaveLength(2);
+      expect(db.prepare("SELECT agent_id FROM events WHERE id = 'E1'").get()).toEqual({ agent_id: null });
+      expect(service.listAgents({ includeRemoved: true }).some((item) => item.agent.id === id)).toBe(false);
+      expect(service.purgeAgent({ agentId: id })).toMatchObject({ success: false, errorCode: 'AGENT_NOT_FOUND' });
+    });
+
+    it('keeps a profile another agent still uses', () => {
+      const first = createCodex({ profileId: 'first' });
+      const second = createCodex({ profileId: 'second' });
+      if (!first.success || !second.success) throw new Error('setup failed');
+      const sharedProfile = first.agent.agent_profile_id!;
+      repo.setAgentProfileId(second.agent.id, sharedProfile);
+      expect(service.removeAgent({ agentId: first.agent.id }).success).toBe(true);
+      expect(service.purgeAgent({ agentId: first.agent.id }).success).toBe(true);
+      expect(repo.getAgentProfile(sharedProfile)).not.toBeNull();
+    });
+
+    it('refuses an agent that is still on the roster or still has work, and changes nothing', () => {
+      const result = createCodex();
+      if (!result.success) throw new Error('setup failed');
+      const id = result.agent.id;
+      expect(service.purgeAgent({ agentId: id })).toMatchObject({ success: false, errorCode: 'AGENT_NOT_REMOVED' });
+
+      expect(service.removeAgent({ agentId: id }).success).toBe(true);
+      const slot = service.listAgents({ includeRemoved: true }).find((item) => item.agent.id === id)!.workerSlots[0];
+      repo.updateWorkerSlotStatus(slot.id, 'RUNNING');
+      expect(service.purgeAgent({ agentId: id })).toMatchObject({
+        success: false, errorCode: 'AGENT_HAS_ACTIVE_WORK', blockers: [{ code: 'BUSY_WORKER_SLOT', reference: slot.id }],
+      });
+      expect(repo.getAgent(id)).not.toBeNull();
+    });
+
+    it('refuses an agent named in the append-only reviewer session ledger', () => {
+      const result = createCodex({ role: 'REVIEWER', profileId: 'reviewer' });
+      if (!result.success) throw new Error('setup failed');
+      const id = result.agent.id;
+      const entry = service.listAgents().find((item) => item.agent.id === id)!;
+      db.prepare("UPDATE provider_accounts SET health_status = 'AVAILABLE' WHERE id = ?").run(entry.account!.id);
+      db.prepare("UPDATE provider_resources SET health_status = 'AVAILABLE' WHERE id = ?").run(entry.resource!.id);
+      // A verified, settled submission as the reviewer-session insert fence requires; unrelated references stay unresolved.
+      insertFixtureRow(db, 'tasks', { id: 'T-rev', project_id: 'P-rev', state: 'REVIEW_READY', ownership_epoch: 1 });
+      insertFixtureRow(db, 'coder_submissions', { id: 'S1', task_id: 'T-rev', task_ownership_epoch: 1, selected_account_id: null });
+      insertFixtureRow(db, 'coder_submission_dispositions', { submission_id: 'S1', disposition_event: 'SETTLED', disposition_reason: 'ACCEPTED_VERIFIED' });
+      insertFixtureRow(db, 'coder_submission_adjudications', {
+        id: 'ADJ1', submission_id: 'S1', task_id: 'T-rev', task_ownership_epoch: 1, action: 'ADMIT_VERIFICATION', status: 'VERIFIED',
+        authority_snapshot_hash: 'auth-hash', verification_result_envelope_json: '{}', verification_result_envelope_hash: 'env-hash',
+        test_run_id: 'run', git_status_evidence_id: 'status', git_diff_evidence_id: 'diff', recovery_fenced_at: null,
+      });
+      insertFixtureRow(db, 'mcp_reviewer_sessions', {
+        adjudication_id: 'ADJ1', submission_id: 'S1', reviewer_agent_id: id, reviewer_provider_id: entry.provider!.id,
+        reviewer_account_id: entry.account!.id, reviewer_resource_id: entry.resource!.id, task_ownership_epoch: 1,
+        authority_snapshot_hash: 'auth-hash', verification_result_envelope_hash: 'env-hash',
+        issued_at: '2026-10-01T00:00:00.000Z', expires_at: '2026-10-01T01:00:00.000Z', revoked_at: null,
+      });
+      expect(service.removeAgent({ agentId: id }).success).toBe(true); // The session expired, so it is not active work.
+
+      expect(service.purgeAgent({ agentId: id })).toMatchObject({ success: false, errorCode: 'AGENT_HAS_AUDIT_LEDGER' });
+      expect(repo.getAgent(id)).not.toBeNull();
+    });
+
+    it('does not let bootstrap bring back a default agent the owner deleted permanently', () => {
+      expect(service.removeAgent({ agentId: 'agent-gemini-coder' }).success).toBe(true);
+      expect(service.purgeAgent({ agentId: 'agent-gemini-coder' }).success).toBe(true);
+      BootstrapService.seedDefaultResources(repo);
+      expect(repo.getAgent('agent-gemini-coder')).toBeNull();
+      expect(repo.getAgent('agent-primary-manager')).not.toBeNull();
+    });
   });
 });

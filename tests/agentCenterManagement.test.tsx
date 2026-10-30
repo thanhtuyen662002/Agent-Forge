@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OrchestratorProvider } from '../src/ui/context/OrchestratorContext';
 import { I18nProvider } from '../src/ui/context/I18nContext';
 import { AgentCenterView } from '../src/ui/views/AgentCenterView';
-import { normalizeAgentMutationReply, normalizeAgentRosterReply } from '../src/ui/agentRoster';
+import { normalizeAgentMutationReply, normalizeAgentPurgeReply, normalizeAgentRosterReply } from '../src/ui/agentRoster';
 import { getTranslation } from '../src/shared/i18n';
 import type { SupportedLocale } from '../src/shared/i18n/types';
 
@@ -71,6 +71,10 @@ beforeEach(() => {
       const item = roster.find((candidate) => candidate.agent.id === agentId);
       item.agent = { ...item.agent, removed_at: null, status: 'IDLE' };
       return { success: true, agent: item.agent };
+    }),
+    purgeAgent: vi.fn(async (agentId: string) => {
+      roster = roster.filter((candidate) => candidate.agent.id !== agentId);
+      return { success: true, agentId };
     }),
   };
   (window as any).orchestrator = api;
@@ -153,6 +157,51 @@ describe('Agent Center owner management through the real view', () => {
     expect(api.restoreAgent).toHaveBeenCalledWith('a');
     expect(container.textContent).toContain('Agent "Agent a" is back on the active list.');
   });
+
+  describe('permanent delete of a removed agent (#344)', () => {
+    const showRemoved = async (locale: SupportedLocale = 'en-US') => {
+      roster[0].agent = { ...roster[0].agent, removed_at: now, status: 'OFFLINE' };
+      await render(locale);
+      await act(async () => { container.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click(); });
+    };
+    const dialogButton = (label: string) => Array.from(container.querySelectorAll<HTMLButtonElement>('[role="dialog"] button'))
+      .find((node) => node.textContent?.trim() === label)!;
+    const purgeButton = (locale: SupportedLocale = 'en-US') =>
+      container.querySelector<HTMLButtonElement>(`button[aria-label="${text(locale, 'agentCenter.actions.purge')}: Agent a"]`);
+
+    it('is offered only for removed agents', async () => {
+      await render();
+      expect(purgeButton()).toBeNull();
+      await act(async () => { container.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click(); });
+      expect(purgeButton()).toBeNull();
+    });
+
+    it.each(['en-US', 'vi-VN'] as SupportedLocale[])('deletes only after a confirmation that it cannot be undone (%s)', async (locale) => {
+      await showRemoved(locale);
+      await act(async () => { purgeButton(locale)!.click(); });
+      expect(api.purgeAgent).not.toHaveBeenCalled();
+      expect(container.querySelector('#purge-confirm-title')?.textContent).toBe(text(locale, 'agentCenter.purge.confirmTitle', { name: 'Agent a' }));
+      expect(container.querySelector('#purge-confirm-body')?.textContent).toBe(text(locale, 'agentCenter.purge.confirmBody'));
+      await act(async () => { dialogButton(text(locale, 'agentCenter.purge.confirm')).click(); });
+      expect(api.purgeAgent).toHaveBeenCalledWith('a');
+      expect(container.querySelector('[role="dialog"]')).toBeNull();
+      expect(container.textContent).toContain(text(locale, 'agentCenter.purge.purged', { name: 'Agent a' }));
+      expect(Array.from(container.querySelectorAll('h3[title]'), (node) => node.textContent)).toEqual(['Agent busy']);
+    });
+
+    it('keeps the dialog open and explains an audit-record refusal', async () => {
+      api.purgeAgent.mockResolvedValueOnce({ success: false, errorCode: 'AGENT_HAS_AUDIT_LEDGER', error: 'x' });
+      await showRemoved();
+      await act(async () => { purgeButton()!.click(); });
+      await act(async () => { dialogButton('Keep agent').click(); });
+      expect(container.querySelector('[role="dialog"]')).toBeNull();
+      expect(api.purgeAgent).not.toHaveBeenCalled();
+      await act(async () => { purgeButton()!.click(); });
+      await act(async () => { dialogButton(text('en-US', 'agentCenter.purge.confirm')).click(); });
+      expect(container.querySelector('[role="dialog"] [role="alert"]')?.textContent).toBe(text('en-US', 'agentCenter.errors.AGENT_HAS_AUDIT_LEDGER'));
+      expect(roster.map((item) => item.agent.id)).toContain('a');
+    });
+  });
 });
 
 describe('agent reply normalization', () => {
@@ -165,6 +214,11 @@ describe('agent reply normalization', () => {
       .toMatchObject({ success: false, code: 'INVALID_RESPONSE' });
     expect(normalizeAgentMutationReply({ success: false, errorCode: 'AGENT_HAS_ACTIVE_WORK', blockers: [{ code: 'AGENT_BUSY', reference: 'x' }] }))
       .toEqual({ success: false, code: 'AGENT_HAS_ACTIVE_WORK', blockers: [{ code: 'AGENT_BUSY', reference: 'x' }] });
+    expect(normalizeAgentPurgeReply({ success: true, agentId: 'other' }, 'a')).toMatchObject({ success: false, code: 'INVALID_RESPONSE' });
+    expect(normalizeAgentPurgeReply({ success: true, agent: agent('a') }, 'a')).toMatchObject({ success: false, code: 'INVALID_RESPONSE' });
+    expect(normalizeAgentPurgeReply({ success: true, agentId: 'a' }, 'a')).toEqual({ success: true, agentId: 'a' });
+    expect(normalizeAgentPurgeReply({ success: false, errorCode: 'AGENT_HAS_AUDIT_LEDGER' }, 'a'))
+      .toEqual({ success: false, code: 'AGENT_HAS_AUDIT_LEDGER', blockers: [] });
     expect(normalizeAgentRosterReply({})).toBeNull();
     expect(normalizeAgentRosterReply([{ agent: agent('a'), connection: 'WEB', workerSlots: [], blockers: [] }])).toBeNull();
     expect(normalizeAgentRosterReply([entry('a')])).toHaveLength(1);

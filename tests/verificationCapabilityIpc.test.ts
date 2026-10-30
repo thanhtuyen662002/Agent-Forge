@@ -70,6 +70,21 @@ describe('native owner verification capability IPC', () => {
       }
     });
 
+    it('cannot delete anything permanently; that stays an owner action in the app (#344)', async () => {
+      repo.insertTrashEntry('PROJECT', 'P', 'P', new Date().toISOString());
+      await expect(registry.invoke('trash:purgeProject', { projectId: 'P' })).rejects.toThrow('MCP_CHANNEL_NOT_ALLOWED');
+      await expect(registry.invoke('agents:purge', { agentId: 'agent-x' })).rejects.toThrow('MCP_CHANNEL_NOT_ALLOWED');
+      expect(repo.getProjectMetadata('P')).not.toBeNull();
+
+      const purge = native.handlers.get('trash:purgeProject')!;
+      await expect(purge({ senderFrame: { url: 'https://remote.example/' } }, { projectId: 'P' })).rejects.toBeInstanceOf(IpcSenderTrustError);
+      expect(await purge(trusted, { projectId: 'P', extra: 1 })).toMatchObject({ success: false, errorCode: 'INVALID_INPUT' });
+      expect(await native.handlers.get('agents:purge')!(trusted, { agentId: 'agent-x' })).toMatchObject({ success: false, errorCode: 'AGENT_NOT_FOUND' });
+      expect(await purge(trusted, { projectId: 'P' })).toEqual({ success: true, entityType: 'PROJECT', entityId: 'P', invalidatedAuthorizations: 0 });
+      expect(repo.getProjectMetadata('P')).toBeNull();
+      expect(fs.existsSync(path.join(root, '.git'))).toBe(true); // The repository on disk is untouched.
+    });
+
     it('checks a named repository like the native folder picker', async () => {
       expect(await registry.selectRepositoryPath(root)).toMatchObject({ success: true, selectionId: expect.any(String) });
       const plain = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'af-cap-ipc-plain-')));

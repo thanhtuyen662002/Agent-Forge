@@ -139,6 +139,56 @@ describe('project list search and trash', () => {
     expect(alert.textContent).toContain(en('trash.blockers.TASK_ACTIVE_STATE', { task: 'T2', reference: 'CODING' }));
     expect(context.projects.map((p) => p.id)).toEqual(['P1', 'P2']);
   });
+
+  describe('permanent delete from the trash (#344)', () => {
+    beforeEach(() => {
+      activeProjects = [project('P2', 'Website')];
+      trash.projects = [{ id: 'P1', name: 'Lập trình Desktop', status: 'PAUSED', trashedAt: now }];
+      api.purgeProject = vi.fn(async (projectId: string) => {
+        trash.projects = trash.projects.filter((p) => p.id !== projectId);
+        return { success: true, entityType: 'PROJECT', entityId: projectId, invalidatedAuthorizations: 0 };
+      });
+    });
+
+    const openPurge = async () => {
+      await render(<ProjectsView />);
+      await act(async () => { buttons(`${en('trash.showTrash')} (1)`)[0].click(); });
+      const purge = container.querySelector<HTMLButtonElement>(`button[aria-label="${en('trash.deletePermanently')}: Lập trình Desktop"]`)!;
+      expect(purge.textContent?.trim()).toBe(en('trash.deletePermanently'));
+      await act(async () => { purge.click(); });
+    };
+    const confirmButton = () => container.querySelector('[role="dialog"]')!.querySelectorAll('button')[1];
+
+    it('asks for an explicit confirmation that says it cannot be undone and keeps repository files', async () => {
+      await openPurge();
+      expect(api.purgeProject).not.toHaveBeenCalled();
+      expect(container.querySelector('#purge-confirm-title')?.textContent).toBe(en('trash.purge.title', { name: 'Lập trình Desktop' }));
+      expect(container.querySelector('#purge-confirm-body')?.textContent).toBe(en('trash.purge.body'));
+      expect(en('trash.purge.body')).toMatch(/cannot be undone/);
+      expect(getTranslation('vi-VN', 'trash.purge.body')).toMatch(/Không thể hoàn tác/);
+      // Cancel leaves everything in place.
+      await act(async () => { container.querySelector('[role="dialog"]')!.querySelectorAll('button')[0].click(); });
+      expect(container.querySelector('[role="dialog"]')).toBeNull();
+      expect(api.purgeProject).not.toHaveBeenCalled();
+    });
+
+    it('deletes the project permanently after confirmation and empties it from the trash', async () => {
+      await openPurge();
+      await act(async () => { confirmButton().dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+      expect(api.purgeProject).toHaveBeenCalledWith('P1');
+      expect(container.querySelector('[role="dialog"]')).toBeNull();
+      expect(container.textContent).toContain(en('trash.results.projectPurged', { name: 'Lập trình Desktop' }));
+      expect(container.textContent).toContain(en('trash.empty'));
+    });
+
+    it('explains an audit-record refusal inside the dialog', async () => {
+      api.purgeProject.mockResolvedValueOnce({ success: false, errorCode: 'PROJECT_HAS_AUDIT_LEDGER', error: 'x' });
+      await openPurge();
+      await act(async () => { confirmButton().dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+      expect(container.querySelector('[role="dialog"] [role="alert"]')?.textContent).toContain(en('trash.errors.PROJECT_HAS_AUDIT_LEDGER'));
+      expect(trash.projects).toHaveLength(1);
+    });
+  });
 });
 
 describe('task board search and trash', () => {
