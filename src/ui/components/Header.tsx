@@ -6,6 +6,7 @@ import { ShieldAlert, Play, Pause, FolderGit2 } from 'lucide-react';
 import { uiActionFailureKey } from '../actionState';
 import { AutomationStatusBadge } from './AutomationStatusBadge';
 import { UpdateNotice } from './UpdateNotice';
+import { AuthorityHelp } from './AuthorityHelp';
 
 /**
  * One calm row: brand, the active project with its status and automation
@@ -69,17 +70,17 @@ export const Header: React.FC = () => {
 
   return (
     <header className="h-14 bg-surface border-b border-surface-border px-4 flex items-center gap-4 shrink-0 z-30">
-      {/* Brand */}
-      <div className="flex items-center gap-2.5 shrink-0">
+      {/* Brand: as wide as the sidebar, so its divider continues the sidebar's border. */}
+      <div className="w-60 self-stretch flex items-center gap-2.5 shrink-0 border-r border-surface-border">
         <BrandMark className="w-7 h-7 shrink-0" />
         <span className="text-sm font-semibold text-white whitespace-nowrap">Agent Forge</span>
         {!isElectron && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded border border-surface-border text-slate-400 whitespace-nowrap">{t('actions.previewReadOnly')}</span>
+          <span title={t('actions.previewReadOnly')} className="min-w-0 truncate mr-3 text-[10px] px-1.5 py-0.5 rounded border border-surface-border text-slate-400 whitespace-nowrap">{t('actions.previewReadOnly')}</span>
         )}
       </div>
 
       {/* Active project */}
-      <div className="flex items-center gap-2 min-w-0 flex-1 pl-4 border-l border-surface-border">
+      <div className="flex items-center gap-2 min-w-0 flex-1">
         <FolderGit2 className="w-4 h-4 text-slate-500 shrink-0" aria-hidden="true" />
         {projects.length > 0 ? (
           <>
@@ -112,6 +113,7 @@ export const Header: React.FC = () => {
                 <AutomationStatusBadge projectId={activeProject.id} />
               </div>
             )}
+            <AuthorityHelp />
           </>
         ) : (
           <button

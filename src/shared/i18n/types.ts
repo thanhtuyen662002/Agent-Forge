@@ -31,7 +31,6 @@ export interface TranslationDictionary {
     agentCenter: string;
     capacity: string;
     timeline: string;
-    decisions: string;
     evidence: string;
     projects: string;
     settings: string;
@@ -130,9 +129,6 @@ export interface TranslationDictionary {
     allSystemsNormalDesc: string;
     humanAttentionTitle: string;
     inspectBlockedTasks: string;
-    manualRelayTitle: string;
-    manualRelayDesc: string;
-    openManualBridge: string;
     liveStreamTitle: string;
     fullTimeline: string;
     noEvents: string;
@@ -557,6 +553,8 @@ export interface TranslationDictionary {
       title: string;
       subtitle: string;
       empty: string;
+      showAll: string;
+      showFewer: string;
       create: string;
       discard: string;
       confirmDiscard: string;
@@ -1286,7 +1284,6 @@ export interface TranslationDictionary {
   };
   dashboardGuide: {
     title: string;
-    setupComplete: string;
     done: string;
     notDone: string;
     steps: {
