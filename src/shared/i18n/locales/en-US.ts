@@ -172,6 +172,8 @@ export const enUS: TranslationDictionary = {
     },
   },
   taskDetail: {
+    retryNoteLabel: 'Note to the Manager (optional)',
+    retryNotePlaceholder: 'What you changed or decided, e.g. "package.json now has the build scripts"',
     backToBoard: 'Back to Kanban Board',
     openInBridge: 'Open in Manual Bridge',
     stateLabel: 'State',

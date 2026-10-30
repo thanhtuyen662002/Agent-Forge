@@ -172,6 +172,8 @@ export const viVN: TranslationDictionary = {
     },
   },
   taskDetail: {
+    retryNoteLabel: 'Ghi chú cho Quản lý (không bắt buộc)',
+    retryNotePlaceholder: 'Bạn đã sửa hoặc quyết định gì, ví dụ "package.json đã có các lệnh build"',
     backToBoard: 'Quay lại Bảng Kanban',
     openInBridge: 'Mở trong Cầu nối Thủ công',
     stateLabel: 'Trạng thái',

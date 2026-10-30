@@ -1099,7 +1099,9 @@ export function registerIpcHandlers(
   registerPrivilegedHandler('task:retry', async (_, payload: unknown) => {
     const target = readIntegrationTarget(payload);
     if (!target) return { success: false, errorCode: 'TASK_NOT_FOUND' };
-    const result = taskService.retryTask(target.projectId, target.taskId);
+    const note = payload && typeof payload === 'object' ? (payload as { note?: unknown }).note : undefined;
+    if (note !== undefined && note !== null && typeof note !== 'string') return { success: false, errorCode: 'INVALID_INPUT' };
+    const result = taskService.retryTask(target.projectId, target.taskId, undefined, note ?? null);
     if (result.success) void runtime.automation?.tick();
     return sanitizeOutputValue(result);
   });

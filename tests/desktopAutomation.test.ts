@@ -940,6 +940,32 @@ describe('desktop automation runtime', () => {
       expect(managerRequests).toHaveLength(2); // A fresh decision after the owner's retry.
     }, 120_000);
 
+    it('gives the Manager the owner note of a retry, for that revision only (#364)', async () => {
+      reviewReply = verdict('FIX_REQUIRED');
+      const { task } = await runToReview();
+      addManager();
+      managerReply = (request) => ({ executionId: request.runtimeBinding!.executionId!, status: 'COMPLETED', outputProtocol: JSON.stringify({
+        protocol: 'manager.v1', message_id: `m-${crypto.randomUUID()}`, project_id: projectId, task_id: request.taskId, decision: 'BLOCK',
+        instructions: ['package.json lacks package:win'], expected_task_state: 'CODING', expected_revision: repo.getTask(request.taskId)!.revision_count }) });
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      await service.tick();
+      await service.drain();
+      expect(managerRequests[0].instructions.join('\n')).not.toContain('Owner note');
+
+      expect(tasks.retryTask(projectId, task.id, undefined, 'x'.repeat(2001))).toMatchObject({ success: false, errorCode: 'RETRY_NOTE_TOO_LONG' });
+      expect(tasks.retryTask(projectId, task.id, undefined, '  package.json now has package:win  ')).toMatchObject({ success: true });
+      await service.tick();
+      await service.drain();
+      expect(managerRequests).toHaveLength(2);
+      expect(managerRequests[1].instructions.join('\n'))
+        .toContain('Owner note with the latest retry (from the project owner; it answers what stopped this task and overrides earlier reports it contradicts): package.json now has package:win');
+
+      // A later revision moved past the note.
+      db.prepare('UPDATE tasks SET revision_count = revision_count + 1 WHERE id = ?').run(task.id);
+      expect((service.getManager() as unknown as { instructions(t: unknown, k: string): string[] })
+        .instructions(repo.getTask(task.id)!, 'NEXT_REVISION').join('\n')).not.toContain('Owner note');
+    }, 120_000);
+
     it('never retries a trashed NEEDS_HUMAN task or changes it when a step fails (#318)', async () => {
       reviewReply = verdict('FIX_REQUIRED');
       const { task } = await runToReview((taskId) => { db.prepare('UPDATE tasks SET max_revisions = 1 WHERE id = ?').run(taskId); });

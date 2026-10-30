@@ -175,6 +175,8 @@ export interface TranslationDictionary {
     };
   };
   taskDetail: {
+    retryNoteLabel: string;
+    retryNotePlaceholder: string;
     backToBoard: string;
     openInBridge: string;
     stateLabel: string;
