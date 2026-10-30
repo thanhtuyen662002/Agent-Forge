@@ -175,6 +175,8 @@ export interface TranslationDictionary {
     };
   };
   taskDetail: {
+    dependenciesTitle: string;
+    dependenciesNone: string;
     backToBoard: string;
     openInBridge: string;
     stateLabel: string;
@@ -540,6 +542,7 @@ export interface TranslationDictionary {
       REVIEW_FAILED: string;
       REVIEW_STALE: string;
       REVIEW_INTERRUPTED: string;
+      WAITING_FOR_DEPENDENCIES: string;
       NO_MANAGER: string;
       MANAGER_NOT_AVAILABLE: string;
       MANAGER_PROPOSAL_PENDING: string;

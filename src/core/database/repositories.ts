@@ -370,6 +370,28 @@ export class Repository {
       .run(projectId, `automation.task_context:${taskId}`, JSON.stringify(paths));
   }
 
+  /** Tasks of the same project whose code this task needs (#362), in the order given. */
+  public getTaskDependencies(projectId: string, taskId: string): string[] {
+    const row = this.db
+      .prepare('SELECT value_json FROM project_settings WHERE project_id = ? AND key = ?')
+      .get(projectId, `automation.task_dependencies:${taskId}`) as { value_json?: unknown } | undefined;
+    try {
+      const value = typeof row?.value_json === 'string' ? JSON.parse(row.value_json) : [];
+      return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+    } catch {
+      return [];
+    }
+  }
+
+  public setTaskDependencies(projectId: string, taskId: string, dependsOn: string[]): void {
+    this.db
+      .prepare(`
+        INSERT INTO project_settings (project_id, key, value_json) VALUES (?, ?, ?)
+        ON CONFLICT(project_id, key) DO UPDATE SET value_json = excluded.value_json
+      `)
+      .run(projectId, `automation.task_dependencies:${taskId}`, JSON.stringify([...new Set(dependsOn)]));
+  }
+
   /** Records the planning anchor once; an existing anchor is never replaced. */
   public setProjectPlanningTaskId(projectId: string, taskId: string): boolean {
     return this.db

@@ -13,6 +13,7 @@ import { VerificationCapabilityService } from '../core/services/VerificationCapa
 import { VerificationCapabilityError, VerificationCapabilityPayload, VerificationCapabilityReference } from '../core/types/verificationCapability';
 import { ProtocolParser } from '../core/protocol/parser';
 import { validateContextPaths } from '../core/protocol/planProtocol';
+import { dependencyError } from '../core/services/TaskDependencies';
 import { PackageGenerator } from '../core/protocol/packageGenerator';
 import { defaultArtifactStore } from '../core/services/ArtifactStore';
 import { EmergencyStopService } from '../core/services/EmergencyStopService';
@@ -46,6 +47,7 @@ import {
   TaskScopedIpcSchema,
   TaskContextPathsIpcSchema,
   SetTaskContextPathsIpcSchema,
+  SetTaskDependenciesIpcSchema,
   StartReviewIpcSchema,
   RunVerificationIpcSchema,
   EmergencyStopIpcSchema,
@@ -105,7 +107,7 @@ const isMcpCaller = (event: unknown): boolean => event === MCP_CALLER_EVENT;
 /** Channels an authenticated MCP caller may invoke; never credentials, sign-in, release or MCP settings. */
 export const MCP_INVOKABLE_CHANNELS: ReadonlySet<string> = new Set([
   'project:list', 'project:get', 'project:create', 'project:importContract', 'project:transition',
-  'task:list', 'task:get', 'task:create', 'task:retry', 'task:getContextPaths', 'task:setContextPaths', 'events:list', 'agents:roster',
+  'task:list', 'task:get', 'task:create', 'task:retry', 'task:getContextPaths', 'task:setContextPaths', 'task:getDependencies', 'task:setDependencies', 'events:list', 'agents:roster',
   'verification:getCommands', 'verification:saveCommands',
   'automation:status', 'automation:managerDecisions', 'automation:setManagerMode', 'automation:decideManagerProposal',
   'automation:getParallelTasks', 'automation:setParallelTasks', 'verification:getEnvironment', 'verification:setEnvironment',
@@ -187,7 +189,7 @@ export function registerIpcHandlers(
   // project or task are refused before the handler runs; trashing also
   // invalidated its AUTHORIZED executions and dispatch re-checks the trash.
   const trashFencedChannels = new Set([
-    'project:importContract', 'project:transition', 'task:create', 'task:retry', 'task:startReview', 'task:setContextPaths',
+    'project:importContract', 'project:transition', 'task:create', 'task:retry', 'task:startReview', 'task:setContextPaths', 'task:setDependencies',
     'protocol:generateWorkOrder', 'protocol:generateReviewPackage', 'verification:runTests',
     'verification:saveCommands', 'routing:routeTask', 'routing:authorizeTask',
     'routing:dispatchAuthorization', 'routing:generateAuthorizedWorkOrder',
@@ -462,6 +464,25 @@ export function registerIpcHandlers(
     if (!check.ok) return { success: false, errorCode: check.reasonCode, path: check.path };
     repo.setTaskContextPaths(scoped.project.id, scoped.task.id, check.paths);
     return { success: true, paths: check.paths };
+  });
+
+  registerPrivilegedHandler('task:getDependencies', async (_, payload: unknown) => {
+    const parsed = TaskContextPathsIpcSchema.safeParse(payload);
+    if (!parsed.success) return { success: false, errorCode: 'INVALID_INPUT' };
+    if (!contextTask(parsed.data.projectId, parsed.data.taskId)) return { success: false, errorCode: 'TASK_NOT_FOUND' };
+    return { success: true, dependsOn: repo.getTaskDependencies(parsed.data.projectId, parsed.data.taskId) };
+  });
+
+  registerPrivilegedHandler('task:setDependencies', async (_, payload: unknown) => {
+    const parsed = SetTaskDependenciesIpcSchema.safeParse(payload);
+    if (!parsed.success) return { success: false, errorCode: 'INVALID_INPUT' };
+    const scoped = contextTask(parsed.data.projectId, parsed.data.taskId);
+    if (!scoped) return { success: false, errorCode: 'TASK_NOT_FOUND' };
+    const dependsOn = [...new Set(parsed.data.dependsOn.map((value) => value.trim()).filter(Boolean))];
+    const error = dependencyError(repo, scoped.project.id, scoped.task.id, dependsOn);
+    if (error) return { success: false, errorCode: error };
+    repo.setTaskDependencies(scoped.project.id, scoped.task.id, dependsOn);
+    return { success: true, dependsOn };
   });
 
   registerPrivilegedHandler('task:startReview', async (_, payload: unknown) => {

@@ -186,6 +186,12 @@ export type ReviewProtocol = z.infer<typeof ReviewProtocolSchema>;
 // 6. Manager Plan (plan.v1)
 // ==========================================
 
+/**
+ * Tasks one plan may hold. 20 fit a single milestone (VidFlow M1 used 8); a project
+ * planned in one pass from several milestones needs more (#334).
+ */
+export const MAX_PLAN_TASKS = 60;
+
 export const PlanTaskSchema = z.object({
   title: boundedString(z.string().min(1).max(200), MAX_PROTOCOL_STRING_BYTES),
   description: protocolString().optional().default(''),
@@ -195,6 +201,12 @@ export const PlanTaskSchema = z.object({
   risk: upperCaseEnum(RiskLevelEnum).optional().default('MEDIUM'),
   /** Repository paths the coder needs for this task (#254); validated before use. */
   context_paths: boundedArray(z.array(requiredProtocolString()), 32).optional().default([]),
+  /**
+   * 1-based numbers of earlier tasks in the same plan whose code this task needs (#362).
+   * A task starts only after those are done (and integrated when automatic integration is on);
+   * a task without dependencies can run in parallel with others.
+   */
+  depends_on: boundedArray(z.array(z.number().int().min(1).max(MAX_PLAN_TASKS)), 20).optional().default([]),
 });
 export type PlanTask = z.infer<typeof PlanTaskSchema>;
 
@@ -203,12 +215,6 @@ export type PlanTask = z.infer<typeof PlanTaskSchema>;
  * bound to the project and to the SHA-256 of the exact contract it planned;
  * parsed only by the automated planning path, never by the protocol inbox.
  */
-/**
- * Tasks one plan may hold. 20 fit a single milestone (VidFlow M1 used 8); a project
- * planned in one pass from several milestones needs more (#334).
- */
-export const MAX_PLAN_TASKS = 60;
-
 export const PlanProtocolSchema = z.object({
   protocol: z.literal('plan.v1'),
   message_id: requiredProtocolString(),

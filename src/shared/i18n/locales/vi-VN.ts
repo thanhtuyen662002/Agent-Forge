@@ -172,6 +172,8 @@ export const viVN: TranslationDictionary = {
     },
   },
   taskDetail: {
+    dependenciesTitle: 'Phụ thuộc',
+    dependenciesNone: 'Không phụ thuộc task nào; có thể chạy song song với task khác.',
     backToBoard: 'Quay lại Bảng Kanban',
     openInBridge: 'Mở trong Cầu nối Thủ công',
     stateLabel: 'Trạng thái',
@@ -537,6 +539,7 @@ export const viVN: TranslationDictionary = {
       REVIEW_FAILED: 'Lượt đánh giá tự động không hoàn tất nên chưa áp dụng kết luận nào. Hãy tự đánh giá nhiệm vụ.',
       REVIEW_STALE: 'Thay đổi đã bị đổi sau khi kiểm thử nên kết quả đánh giá không được áp dụng.',
       REVIEW_INTERRUPTED: 'Lượt đánh giá tự động bị gián đoạn (ví dụ do khởi động lại); chưa áp dụng kết luận nào.',
+      WAITING_FOR_DEPENDENCIES: 'Các task còn lại đang chờ task mà chúng phụ thuộc làm xong và được đưa vào nhánh chính.',
       NO_MANAGER: 'Hãy thêm tác tử Quản lý (Codex CLI, tài khoản riêng) trong Trung tâm Tác tử để nhiệm vụ tự bắt đầu, hoặc tự duyệt nhiệm vụ.',
       MANAGER_NOT_AVAILABLE: 'Hiện chưa có tác tử Quản lý dùng được (chưa đăng nhập, đang bận, hoặc CLI của nó không quản lý được).',
       MANAGER_PROPOSAL_PENDING: 'Quản lý đã đề xuất bước tiếp theo. Hãy duyệt hoặc từ chối trong mục Quyết định của Quản lý.',
