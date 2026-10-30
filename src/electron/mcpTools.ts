@@ -289,15 +289,16 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
   },
   {
     name: 'retry_task',
-    description: 'Retry a task in NEEDS_HUMAN (it used all its revisions) with 3 more revisions, or a CODING task whose coder runs all failed (automation phase FAILED); the Manager first reads why the last revision failed.',
+    description: 'Retry a task in NEEDS_HUMAN (it used all its revisions) with 3 more revisions, a BLOCKED task, or a CODING task whose coder runs all failed (automation phase FAILED); the Manager first reads why the last revision failed, and the optional owner note (#364), e.g. "package.json now has the scripts the coder asked for".',
     inputSchema: {
       type: 'object',
-      properties: { projectId: str('Project ID.'), taskId: str('Task ID.') },
+      properties: { projectId: str('Project ID.'), taskId: str('Task ID.'), note: str('Optional note to the Manager: what the owner changed or decided (at most 2000 characters).') },
       required: ['projectId', 'taskId'],
       additionalProperties: false,
     },
     async run(args, registry) {
-      return expectSuccess(await registry.invoke('task:retry', { projectId: text(args, 'projectId'), taskId: text(args, 'taskId') }));
+      const note = text(args, 'note', false);
+      return expectSuccess(await registry.invoke('task:retry', { projectId: text(args, 'projectId'), taskId: text(args, 'taskId'), ...(note ? { note } : {}) }));
     },
   },
   {

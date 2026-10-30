@@ -726,6 +726,15 @@ export class ProductManagerService {
     return null;
   }
 
+  /** The note of the owner's latest retry of this revision, if it gave one (#364); a later revision moved past it. */
+  private ownerRetryNote(task: Task): string | null {
+    const latest = this.repo.getProjectEventsOfTypes(task.project_id, [OWNER_TASK_RETRIED_EVENT], task.id)
+      .filter((event) => (event.structured_payload as { revision?: unknown } | null)?.revision === task.revision_count)
+      .sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0];
+    const note = (latest?.structured_payload as { ownerNote?: unknown } | null)?.ownerNote;
+    return typeof note === 'string' && note.trim() ? note.trim() : null;
+  }
+
   /** Why the previous revision was sent back: its review issues and its failed test run, if any. */
   private previousRevisionResults(task: Task): string[] {
     const previous = task.revision_count - 1;
@@ -790,6 +799,11 @@ export class ProductManagerService {
       ...task.acceptance_criteria.map((criterion) => `Acceptance criterion: ${criterion}`),
       ...task.constraints.map((constraint) => `Constraint: ${constraint}`),
     ];
+    // The owner's note with the latest retry (#364): in VidFlow M8.6 the owner had added the
+    // package.json entries a coder reported missing, and the Manager, seeing only that report,
+    // blocked the task again.
+    const ownerNote = this.ownerRetryNote(task);
+    if (ownerNote) lines.push(`Owner note with the latest retry (from the project owner; it answers what stopped this task and overrides earlier reports it contradicts): ${ownerNote}`);
     if (kind === 'NEXT_REVISION') {
       lines.push(`This is revision ${task.revision_count} of ${task.max_revisions}. The previous revision was sent back.`);
       lines.push(...this.previousRevisionResults(task));

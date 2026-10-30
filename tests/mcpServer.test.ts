@@ -136,6 +136,9 @@ describe('local MCP server (#289)', () => {
     replies['task:retry'] = { success: true, task: { id: 'TSK-1', state: 'CODING' } };
     expect((await call('retry_task', { projectId: 'PROJ-1', taskId: 'TSK-1' })).isError).toBe(false);
     expect(calls).toEqual([{ channel: 'task:retry', payload: { projectId: 'PROJ-1', taskId: 'TSK-1' } }]);
+    calls.length = 0;
+    expect((await call('retry_task', { projectId: 'PROJ-1', taskId: 'TSK-1', note: 'package.json is fixed' })).isError).toBe(false);
+    expect(calls).toEqual([{ channel: 'task:retry', payload: { projectId: 'PROJ-1', taskId: 'TSK-1', note: 'package.json is fixed' } }]); // #364
   });
 
   it('configures the verification environment through the existing handler (#336)', async () => {

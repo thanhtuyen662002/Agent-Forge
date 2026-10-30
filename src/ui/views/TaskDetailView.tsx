@@ -39,6 +39,7 @@ export const TaskDetailView: React.FC = () => {
   const { t } = useI18n();
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState<string | null>(null);
+  const [retryNote, setRetryNote] = useState('');
   const { status: automationStatus } = useAutomationStatus();
 
   const [isRunningTests, setIsRunningTests] = useState<boolean>(false);
@@ -81,8 +82,9 @@ export const TaskDetailView: React.FC = () => {
     setRetrying(true);
     setRetryError(null);
     try {
-      const reply = await api.retryTask(task.project_id, task.id);
+      const reply = await api.retryTask(task.project_id, task.id, retryNote.trim() || undefined);
       if (!reply?.success) setRetryError(String(reply?.errorCode ?? 'IPC_REJECTED'));
+      else setRetryNote('');
       await refreshData();
     } catch {
       setRetryError('IPC_REJECTED');
@@ -138,14 +140,26 @@ export const TaskDetailView: React.FC = () => {
       </div>
 
       {retryable && validTask && (
-        <div role="region" aria-label={t('taskDetail.retryTitle')} className="bg-amber-500/10 border border-amber-500/40 rounded-2xl p-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="space-y-1">
+        <div role="region" aria-label={t('taskDetail.retryTitle')} className="bg-amber-500/10 border border-amber-500/40 rounded-2xl p-5 flex flex-col md:flex-row md:items-end justify-between gap-4">
+          <div className="space-y-1 flex-1 min-w-0">
             <h3 className="text-sm font-bold text-amber-300 flex items-center space-x-2">
               <AlertTriangle className="w-4 h-4" />
               <span>{t('taskDetail.retryTitle')}</span>
             </h3>
             <p className="text-xs text-slate-300">{task.state === 'NEEDS_HUMAN' ? t('taskDetail.retryHint', { count: OWNER_RETRY_REVISIONS }) : task.state === 'BLOCKED' ? t('taskDetail.retryBlockedHint') : t('taskDetail.retryCoderHint')}</p>
             {retryError && <p role="alert" className="text-xs text-red-300">{t('taskDetail.retryFailed', { code: retryError })}</p>}
+            {/* What the owner changed or decided; the Manager reads it before deciding (#364). */}
+            <label className="block pt-2 text-xs text-slate-300">
+              <span className="block mb-1">{t('taskDetail.retryNoteLabel')}</span>
+              <textarea
+                value={retryNote}
+                maxLength={2000}
+                rows={2}
+                onChange={(event) => setRetryNote(event.target.value)}
+                placeholder={t('taskDetail.retryNotePlaceholder')}
+                className="w-full bg-surface border border-surface-border rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-amber-400"
+              />
+            </label>
           </div>
           <button
             onClick={() => void handleRetry()}

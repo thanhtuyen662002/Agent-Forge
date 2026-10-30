@@ -144,6 +144,8 @@ export function captureAuthorizedTaskTransitionBinding(task: Task): AuthorizedTa
 export const OWNER_RETRY_EXTRA_REVISIONS = 3;
 /** Recorded by an owner retry; coder failures settled before it no longer count (#318). */
 export const OWNER_TASK_RETRIED_EVENT = 'OWNER_TASK_RETRIED';
+/** Bound on the note an owner gives the Manager with a retry (#364). */
+export const MAX_OWNER_RETRY_NOTE_CHARS = 2000;
 
 class OwnerRetryError extends Error {
   constructor(public readonly code: string) {
@@ -335,11 +337,17 @@ export class TaskService {
    * - BLOCKED (the Manager stopped it, for example because the coder lacked files,
    *   #328): CLEAR_BLOCKED returns it to CODING, and the Manager is asked again.
    */
-  public retryTask(projectId: string, taskId: string, extraRevisions = OWNER_RETRY_EXTRA_REVISIONS):
+  public retryTask(projectId: string, taskId: string, extraRevisions = OWNER_RETRY_EXTRA_REVISIONS, note?: string | null):
     { success: true; task: Task } | { success: false; errorCode: string; error: string } {
     if (!Number.isInteger(extraRevisions) || extraRevisions < 1 || extraRevisions > 10) {
       return { success: false, errorCode: 'RETRY_REVISIONS_INVALID', error: 'RETRY_REVISIONS_INVALID: Between 1 and 10 more revisions.' };
     }
+    // The owner's answer to what stopped the task (#364), read by the Manager next.
+    const ownerNote = typeof note === 'string' && note.trim() ? note.trim() : null;
+    if (ownerNote && ownerNote.length > MAX_OWNER_RETRY_NOTE_CHARS) {
+      return { success: false, errorCode: 'RETRY_NOTE_TOO_LONG', error: `RETRY_NOTE_TOO_LONG: At most ${MAX_OWNER_RETRY_NOTE_CHARS} characters.` };
+    }
+    const withNote = (payload: Record<string, unknown>) => (ownerNote ? { ...payload, ownerNote } : payload);
     try {
       return this.repo.runInImmediateTransaction(() => {
         const task = this.repo.getTask(taskId);
@@ -353,7 +361,7 @@ export class TaskService {
           if (live || completed || !failed) throw new OwnerRetryError('TASK_NOT_RETRYABLE');
           this.eventService.record(projectId, OWNER_TASK_RETRIED_EVENT,
             `The owner retried task ${taskId} at revision ${task.revision_count}; earlier coder failures no longer count.`,
-            { taskId, revision: task.revision_count, maxRevisions: task.max_revisions }, taskId);
+            withNote({ taskId, revision: task.revision_count, maxRevisions: task.max_revisions }), taskId);
           return { success: true as const, task };
         }
         if (task.state === 'BLOCKED') {
@@ -361,7 +369,7 @@ export class TaskService {
           if (!cleared.success) throw new OwnerRetryError(cleared.errorCode ?? 'TASK_TRANSITION_FAILED');
           this.eventService.record(projectId, OWNER_TASK_RETRIED_EVENT,
             `The owner retried blocked task ${taskId} at revision ${task.revision_count}; the Manager decides again.`,
-            { taskId, revision: task.revision_count, maxRevisions: task.max_revisions }, taskId);
+            withNote({ taskId, revision: task.revision_count, maxRevisions: task.max_revisions }), taskId);
           return { success: true as const, task: this.repo.getTask(taskId)! };
         }
         if (task.state !== 'NEEDS_HUMAN') throw new OwnerRetryError('TASK_NOT_RETRYABLE');
@@ -375,7 +383,7 @@ export class TaskService {
         }
         this.eventService.record(projectId, OWNER_TASK_RETRIED_EVENT,
           `The owner retried task ${taskId} at revision ${task.revision_count} with ${extraRevisions} more revisions.`,
-          { taskId, revision: task.revision_count, previousMaxRevisions: task.max_revisions, maxRevisions }, taskId);
+          withNote({ taskId, revision: task.revision_count, previousMaxRevisions: task.max_revisions, maxRevisions }), taskId);
         return { success: true as const, task: this.repo.getTask(taskId)! };
       });
     } catch (error) {

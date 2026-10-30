@@ -172,6 +172,8 @@ export const enUS: TranslationDictionary = {
     },
   },
   taskDetail: {
+    retryNoteLabel: 'Note to the Manager (optional)',
+    retryNotePlaceholder: 'What you changed or decided, e.g. "package.json now has the build scripts"',
     dependenciesTitle: 'Depends on',
     dependenciesNone: 'No other task; it can run alongside others.',
     backToBoard: 'Back to Kanban Board',
