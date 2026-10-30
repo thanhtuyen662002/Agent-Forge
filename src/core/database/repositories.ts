@@ -1665,6 +1665,85 @@ export class Repository {
     return blockers;
   }
 
+  /**
+   * True when an append-only audit ledger (delete-forbidding triggers) holds a
+   * row of the project, directly or through its tasks, assignments or
+   * execution authorizations. Such a project cannot be purged (#344).
+   */
+  public projectHasAuditLedger(projectId: string): boolean {
+    const scope = `
+      WITH t AS (SELECT id FROM tasks WHERE project_id = :p),
+           a AS (SELECT id FROM execution_authorizations WHERE project_id = :p OR task_id IN (SELECT id FROM t)),
+           g AS (SELECT id FROM agent_assignments WHERE project_id = :p OR task_id IN (SELECT id FROM t))`;
+    const checks = [
+      `SELECT 1 FROM coder_submissions WHERE project_id = :p OR task_id IN (SELECT id FROM t)
+         OR authorization_id IN (SELECT id FROM a) OR assignment_id IN (SELECT id FROM g) LIMIT 1`,
+      `SELECT 1 FROM coder_submission_adjudications WHERE project_id = :p OR task_id IN (SELECT id FROM t)
+         OR authorization_id IN (SELECT id FROM a) OR assignment_id IN (SELECT id FROM g) LIMIT 1`,
+      `SELECT 1 FROM coder_submission_workspace_leases WHERE authorization_id IN (SELECT id FROM a)
+         OR assignment_id IN (SELECT id FROM g) LIMIT 1`,
+      'SELECT 1 FROM mcp_submission_sessions WHERE authorization_id IN (SELECT id FROM a) LIMIT 1',
+    ];
+    // Dispositions, adjudication events and reviewer sessions hang off submissions/adjudications (RESTRICT),
+    // so a project without those rows cannot own any of theirs.
+    return checks.some((sql) => Boolean(this.db.prepare(`${scope} ${sql}`).get({ p: projectId })));
+  }
+
+  /**
+   * Permanently deletes every row of a project (#344). Callers run this inside
+   * an immediate transaction after checking runtime blockers and audit ledgers.
+   * RESTRICT references are removed first; the projects row then cascades to
+   * its tasks and the rest.
+   */
+  public purgeProjectRows(projectId: string): void {
+    const tasks = 'SELECT id FROM tasks WHERE project_id = :p';
+    const auths = `SELECT id FROM execution_authorizations WHERE project_id = :p OR task_id IN (${tasks})`;
+    const snapshots = `SELECT id FROM context_snapshots WHERE project_id = :p OR task_id IN (${tasks})`;
+    const contexts = `SELECT id FROM handoff_contexts WHERE project_id = :p OR task_id IN (${tasks}) OR source_snapshot_id IN (${snapshots})`;
+    const transfers = `SELECT id FROM handoff_transfers WHERE task_id IN (${tasks})
+      OR handoff_context_id IN (${contexts}) OR successor_context_snapshot_id IN (${snapshots})`;
+    const statements = [
+      `DELETE FROM execution_recovery_states WHERE authorization_id IN (${auths}) OR transfer_id IN (${transfers})`,
+      `DELETE FROM mcp_client_sessions WHERE authorization_id IN (${auths})`,
+    ];
+    // Created at runtime by ProjectStopFenceService, so older databases may not have it yet.
+    const hasStopAdmissions = Boolean(
+      this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project_stop_admissions'").get(),
+    );
+    if (hasStopAdmissions) {
+      statements.push(`DELETE FROM project_stop_admissions WHERE project_id = :p OR authorization_id IN (${auths})`);
+    }
+    statements.push(
+      `DELETE FROM handoff_transfers WHERE id IN (${transfers})`,
+      `DELETE FROM handoff_contexts WHERE id IN (${contexts})`,
+      `DELETE FROM execution_authorizations WHERE id IN (${auths})`,
+      'DELETE FROM verification_commands WHERE project_id = :p',
+      'DELETE FROM verification_capabilities WHERE project_id = :p',
+      'DELETE FROM workspace_trash WHERE project_id = :p',
+      'DELETE FROM project_settings WHERE project_id = :p',
+      'DELETE FROM project_repository_identities WHERE project_id = :p',
+      'DELETE FROM projects WHERE id = :p',
+    );
+    for (const sql of statements) this.db.prepare(sql).run({ p: projectId });
+  }
+
+  /** Reviewer sessions are append-only and RESTRICT the agent row (#344). */
+  public agentHasReviewerLedger(agentId: string): boolean {
+    return Boolean(this.db.prepare('SELECT 1 FROM mcp_reviewer_sessions WHERE reviewer_agent_id = ? LIMIT 1').get(agentId));
+  }
+
+  /** Deletes an agent row; remaining references to it are ON DELETE SET NULL (#344). */
+  public deleteAgent(agentId: string): boolean {
+    return this.db.prepare('DELETE FROM agents WHERE id = ?').run(agentId).changes === 1;
+  }
+
+  /** Deletes an agent profile no agent uses any more; assignments and attempts keep a NULL reference (#344). */
+  public deleteUnusedAgentProfile(profileId: string): boolean {
+    return this.db
+      .prepare('DELETE FROM agent_profiles WHERE id = ? AND NOT EXISTS (SELECT 1 FROM agents WHERE agent_profile_id = ?)')
+      .run(profileId, profileId).changes === 1;
+  }
+
   public setAgentProfileId(id: string, agentProfileId: string | null): void {
     this.db.prepare('UPDATE agents SET agent_profile_id = ? WHERE id = ?').run(agentProfileId, id);
   }

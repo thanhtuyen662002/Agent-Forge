@@ -4,7 +4,7 @@ import { useI18n } from '../context/I18nContext';
 import { FolderGit2, Plus, FileCode, FolderOpen, Search, Trash2, CheckCircle2 } from 'lucide-react';
 import { uiActionFailureKey } from '../actionState';
 import { AccessibleDialog } from '../components/AccessibleDialog';
-import { ConfirmTrashDialog, TrashFailureMessage, TrashList } from '../components/TrashPanel';
+import { ConfirmPermanentDeleteDialog, ConfirmTrashDialog, TrashFailureMessage, TrashList } from '../components/TrashPanel';
 import { matchesSearch, useWorkspaceTrash } from '../workspaceTrash';
 import type { TrashActionResult } from '../workspaceTrash';
 import type { Project, ProjectContract } from '../../core/types/domain';
@@ -32,6 +32,8 @@ export const ProjectsView: React.FC = () => {
   const [trashTarget, setTrashTarget] = useState<Project | null>(null);
   const [trashFailure, setTrashFailure] = useState<TrashActionResult | null>(null);
   const [trashNotice, setTrashNotice] = useState<{ ok: boolean; message: string; failure?: TrashActionResult } | null>(null);
+  const [purgeTarget, setPurgeTarget] = useState<{ id: string; name: string } | null>(null);
+  const [purgeFailure, setPurgeFailure] = useState<TrashActionResult | null>(null);
   const visibleProjects = useMemo(
     () => projects.filter((project) => matchesSearch(projectQuery, project.name, project.description, project.id)),
     [projects, projectQuery],
@@ -55,6 +57,18 @@ export const ProjectsView: React.FC = () => {
     setTrashNotice(result.success
       ? { ok: true, message: t('trash.results.projectRestored', { name }) }
       : { ok: false, message: '', failure: result });
+  };
+
+  const confirmPurgeProject = async () => {
+    if (!purgeTarget) return;
+    const result = await trash.purgeProject(purgeTarget.id);
+    if (result.success) {
+      setTrashNotice({ ok: true, message: t('trash.results.projectPurged', { name: purgeTarget.name }) });
+      setPurgeTarget(null);
+      setPurgeFailure(null);
+    } else {
+      setPurgeFailure(result);
+    }
   };
   const importing = pendingActions.includes('importContract');
   const approving = pendingActions.includes('projectTransition');
@@ -297,7 +311,26 @@ export const ProjectsView: React.FC = () => {
       {showTrash && (
         trash.loadFailed
           ? <p role="alert" className="text-xs text-rose-300">{t('trash.loadFailed')}</p>
-          : <TrashList listing={trash.listing} show="projects" pending={trash.pending} onRestoreProject={(id, name) => void restoreProject(id, name)} />
+          : <TrashList
+            listing={trash.listing}
+            show="projects"
+            pending={trash.pending}
+            onRestoreProject={(id, name) => void restoreProject(id, name)}
+            onPurgeProject={(id, name) => { setPurgeFailure(null); setPurgeTarget({ id, name }); }}
+          />
+      )}
+
+      {purgeTarget && (
+        <ConfirmPermanentDeleteDialog
+          title={t('trash.purge.title', { name: purgeTarget.name })}
+          body={t('trash.purge.body')}
+          confirmLabel={t('trash.purge.confirm')}
+          cancelLabel={t('trash.purge.cancel')}
+          pending={trash.pending}
+          failure={purgeFailure ? <TrashFailureMessage result={purgeFailure} /> : null}
+          onCancel={() => setPurgeTarget(null)}
+          onConfirm={() => void confirmPurgeProject()}
+        />
       )}
 
       {trashTarget && (

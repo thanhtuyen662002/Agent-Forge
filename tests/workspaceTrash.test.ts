@@ -6,7 +6,9 @@ import path from 'path';
 import { MigrationRunner } from '../src/core/database/migrations';
 import { Repository } from '../src/core/database/repositories';
 import { WorkspaceManagementService } from '../src/core/services/WorkspaceManagementService';
+import { ProjectStopFenceService } from '../src/core/services/ProjectStopFenceService';
 import type { TaskState } from '../src/core/types/domain';
+import { columnsOf, foreignKeysOf, insertFixtureRow, primaryKeyOf, tableNames } from './helpers/schemaRowFixture';
 
 const NOW = '2026-10-24T09:00:00.000Z';
 
@@ -182,5 +184,210 @@ describe('owner trash for projects and tasks', () => {
     expect(service.trashTask({ taskId: 'x', extra: 1 })).toMatchObject({ success: false, errorCode: 'INVALID_INPUT' });
     expect(service.trashProject({ projectId: 'missing' })).toMatchObject({ success: false, errorCode: 'PROJECT_NOT_FOUND' });
     expect(service.restoreTask({ taskId: 'missing' })).toMatchObject({ success: false, errorCode: 'TASK_NOT_FOUND' });
+    expect(service.purgeProject({ projectId: 'missing' })).toMatchObject({ success: false, errorCode: 'PROJECT_NOT_FOUND' });
+    expect(service.purgeProject({ projectId: 1 })).toMatchObject({ success: false, errorCode: 'INVALID_INPUT' });
+  });
+
+  describe('a paused project (#344)', () => {
+    it('can be trashed although its tasks are PAUSED or waiting for the owner', () => {
+      project('P1', 'PAUSED');
+      task('T1', 'P1', 'PAUSED');
+      task('T2', 'P1', 'NEEDS_HUMAN');
+      task('T3', 'P1', 'QUEUED');
+      authorization('A1', 'P1', 'T1');
+      expect(service.trashProject({ projectId: 'P1' })).toMatchObject({ success: true, entityType: 'PROJECT', invalidatedAuthorizations: 1 });
+      expect(repo.isProjectTrashed('P1')).toBe(true);
+      expect(authStatus('A1')).toBe('INVALIDATED');
+    });
+
+    it('still refuses while a worker holds a lease or an execution is in flight', () => {
+      project('P1', 'PAUSED');
+      task('T1', 'P1', 'PAUSED');
+      task('T2', 'P1', 'CODING');
+      db.prepare("INSERT INTO task_leases (task_id, agent_id, lease_token, acquired_at, expires_at, heartbeat_at, released_at) VALUES ('T1', 'agent-w', 'token-w', ?, ?, ?, NULL)").run(NOW, NOW, NOW);
+      authorization('A2', 'P1', 'T2', 'DISPATCHED');
+      db.prepare("UPDATE execution_authorizations SET adapter_started_at = ? WHERE id = 'A2'").run(NOW);
+      expect(service.trashProject({ projectId: 'P1' })).toEqual({
+        success: false, errorCode: 'HAS_ACTIVE_WORK', error: 'The project still has active work.',
+        blockers: [
+          { code: 'ACTIVE_TASK_LEASE', reference: 'T1', taskId: 'T1' },
+          { code: 'IN_FLIGHT_EXECUTION', reference: 'A2', taskId: 'T2' },
+        ],
+      });
+      expect(repo.isProjectTrashed('P1')).toBe(false);
+    });
+
+    it('keeps the task-level rule: a PAUSED task alone cannot be trashed', () => {
+      project('P1', 'PAUSED');
+      task('T1', 'P1', 'PAUSED');
+      expect(service.trashTask({ taskId: 'T1' })).toMatchObject({ success: false, errorCode: 'HAS_ACTIVE_WORK', blockers: [{ code: 'TASK_ACTIVE_STATE' }] });
+    });
+  });
+
+  describe('permanent delete of a trashed project (#344)', () => {
+    const LEDGERS = new Set([
+      'coder_submissions', 'coder_submission_dispositions', 'coder_submission_adjudications',
+      'coder_submission_adjudication_events', 'coder_submission_workspace_leases', 'mcp_submission_sessions', 'mcp_reviewer_sessions',
+    ]);
+    const CORE = new Set(['projects', 'tasks']);
+
+    const counts = () => Object.fromEntries(tableNames(db).map((table) => [table, (db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get() as { c: number }).c]));
+
+    /** Every project-side table: one with a project_id/task_id column, or one that references such a table. */
+    const projectTables = () => {
+      const tables = tableNames(db).filter((table) => !LEDGERS.has(table) && !CORE.has(table) && table !== 'agents');
+      const scoped = new Set(tables.filter((table) => columnsOf(db, table).some((column) => column.name === 'project_id' || column.name === 'task_id')));
+      for (let grew = true; grew;) {
+        grew = false;
+        for (const table of tables) {
+          if (scoped.has(table)) continue;
+          if (foreignKeysOf(db, table).some((fk) => scoped.has(fk.table) || CORE.has(fk.table))) { scoped.add(table); grew = true; }
+        }
+      }
+      return scoped;
+    };
+
+    const sharedRows = new Map<string, Record<string, unknown>>();
+    const sharedRow = (table: string, scoped: Set<string>): Record<string, unknown> => {
+      const existing = sharedRows.get(table);
+      if (existing) return existing;
+      const values: Record<string, unknown> = {};
+      for (const fk of foreignKeysOf(db, table)) {
+        if (scoped.has(fk.table) || CORE.has(fk.table) || LEDGERS.has(fk.table) || fk.table === table) continue;
+        values[fk.from] = sharedRow(fk.table, scoped)[fk.to ?? primaryKeyOf(db, fk.table)];
+      }
+      if (table === 'agents') Object.assign(values, { status: 'IDLE', current_task_id: null, removed_at: null });
+      const row = insertFixtureRow(db, table, values);
+      sharedRows.set(table, row);
+      return row;
+    };
+
+    /**
+     * Builds one row in every project-side table for a project, wired through
+     * real foreign keys (including every RESTRICT chain), plus the shared
+     * provider/agent rows they point at.
+     */
+    const buildProjectGraph = (projectId: string) => {
+      project(projectId, 'PAUSED');
+      const taskId = `${projectId}-T`;
+      task(taskId, projectId, 'PAUSED');
+      const scoped = projectTables();
+      const rows: Record<string, Record<string, unknown>> = {
+        projects: db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId) as Record<string, unknown>,
+        tasks: db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Record<string, unknown>,
+      };
+      const overrides: Record<string, Record<string, unknown>> = {
+        task_leases: { released_at: NOW },
+        account_leases: { released_at: NOW },
+        agent_assignments: { status: 'COMPLETED' },
+        execution_authorizations: { status: 'INVALIDATED', adapter_started_at: null, adapter_finished_at: null },
+        workspace_trash: { entity_type: 'TASK', entity_id: taskId },
+        task_dependencies: { depends_on_task_id: taskId },
+      };
+      const pending = [...scoped];
+      while (pending.length > 0) {
+        const ready = pending.findIndex((table) => foreignKeysOf(db, table).every((fk) => {
+          if (!scoped.has(fk.table) || rows[fk.table] || fk.table === table) return true;
+          const column = columnsOf(db, table).find((candidate) => candidate.name === fk.from);
+          return !column?.notnull && !column?.pk;
+        }));
+        if (ready < 0) throw new Error(`No insert order for: ${pending.join(', ')}`);
+        const [table] = pending.splice(ready, 1);
+        const columns = columnsOf(db, table).map((column) => column.name);
+        if (columns.includes('project_id')) {
+          const existing = db.prepare(`SELECT * FROM ${table} WHERE project_id = ?`).get(projectId) as Record<string, unknown> | undefined;
+          if (existing) { rows[table] = existing; continue; }
+        }
+        const values: Record<string, unknown> = {};
+        if (columns.includes('project_id')) values.project_id = projectId;
+        if (columns.includes('task_id')) values.task_id = taskId;
+        for (const fk of foreignKeysOf(db, table)) {
+          if (fk.table === table || LEDGERS.has(fk.table)) continue;
+          const target = scoped.has(fk.table) || CORE.has(fk.table) ? rows[fk.table] : sharedRow(fk.table, scoped);
+          if (target) values[fk.from] = target[fk.to ?? primaryKeyOf(db, fk.table)];
+        }
+        rows[table] = insertFixtureRow(db, table, { ...values, ...overrides[table] });
+      }
+      expect(db.pragma('foreign_key_check')).toEqual([]);
+      return { taskId, rows, scoped };
+    };
+
+    /** Rows anywhere whose project_id or *task_id column names the project or one of its tasks. */
+    const referencesTo = (projectId: string, taskIds: string[]) => {
+      const hits: string[] = [];
+      for (const table of tableNames(db)) {
+        for (const column of columnsOf(db, table)) {
+          if (column.name === 'project_id') {
+            const c = (db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE project_id = ?`).get(projectId) as { c: number }).c;
+            if (c > 0) hits.push(`${table}.project_id`);
+          } else if (column.name.endsWith('task_id') && taskIds.length > 0) {
+            const c = (db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE "${column.name}" IN (${taskIds.map(() => '?').join(', ')})`).get(...taskIds) as { c: number }).c;
+            if (c > 0) hits.push(`${table}.${column.name}`);
+          }
+        }
+      }
+      return hits;
+    };
+
+    beforeEach(() => {
+      sharedRows.clear();
+      new ProjectStopFenceService(repo); // Creates the runtime project_stop_admissions table, so the purge must cover it.
+    });
+
+    it('erases every row of the project and its tasks, and nothing of another project', () => {
+      buildProjectGraph('P2');
+      const before = counts();
+      const { taskId, scoped } = buildProjectGraph('P1');
+      expect(scoped.has('execution_recovery_states')).toBe(true);
+      expect(scoped.has('mcp_client_sessions')).toBe(true);
+      expect(scoped.has('project_stop_admissions')).toBe(true);
+      expect(referencesTo('P1', [taskId]).length).toBeGreaterThan(20);
+      repo.insertTrashEntry('PROJECT', 'P1', 'P1', NOW);
+
+      expect(service.purgeProject({ projectId: 'P1' })).toEqual({ success: true, entityType: 'PROJECT', entityId: 'P1', invalidatedAuthorizations: 0 });
+      expect(referencesTo('P1', [taskId])).toEqual([]);
+      expect(db.prepare("SELECT COUNT(*) AS c FROM workspace_trash WHERE entity_id IN ('P1', ?)").get(taskId)).toEqual({ c: 0 });
+      expect(counts()).toEqual(before);
+      expect(db.pragma('foreign_key_check')).toEqual([]);
+      expect(repo.getProjectMetadata('P2')).not.toBeNull();
+      expect(service.listTrash().projects).toEqual([]);
+      expect(service.purgeProject({ projectId: 'P1' })).toMatchObject({ success: false, errorCode: 'PROJECT_NOT_FOUND' });
+    });
+
+    it('refuses a project that is not in the trash and changes nothing', () => {
+      buildProjectGraph('P1');
+      const before = counts();
+      expect(service.purgeProject({ projectId: 'P1' })).toMatchObject({ success: false, errorCode: 'NOT_IN_TRASH' });
+      expect(counts()).toEqual(before);
+    });
+
+    it('re-checks live work before deleting', () => {
+      const { taskId } = buildProjectGraph('P1');
+      repo.insertTrashEntry('PROJECT', 'P1', 'P1', NOW);
+      db.prepare('UPDATE task_leases SET released_at = NULL WHERE task_id = ?').run(taskId);
+      const before = counts();
+      expect(service.purgeProject({ projectId: 'P1' })).toMatchObject({
+        success: false, errorCode: 'HAS_ACTIVE_WORK', blockers: [{ code: 'ACTIVE_TASK_LEASE', taskId }],
+      });
+      expect(counts()).toEqual(before);
+    });
+
+    it.each(['coder_submissions', 'mcp_submission_sessions'])('refuses a project with a %s audit row and leaves everything in place', (ledger) => {
+      const { taskId, rows } = buildProjectGraph('P1');
+      repo.insertTrashEntry('PROJECT', 'P1', 'P1', NOW);
+      const values: Record<string, unknown> = { authorization_id: rows.execution_authorizations.id };
+      if (ledger === 'coder_submissions') {
+        Object.assign(values, {
+          project_id: 'P1', task_id: taskId, attempt_id: rows.task_attempts.id, assignment_id: rows.agent_assignments.id,
+          session_id: insertFixtureRow(db, 'mcp_submission_sessions', { authorization_id: rows.execution_authorizations.id }).id,
+        });
+      }
+      insertFixtureRow(db, ledger, values);
+      const before = counts();
+
+      expect(service.purgeProject({ projectId: 'P1' })).toMatchObject({ success: false, errorCode: 'PROJECT_HAS_AUDIT_LEDGER' });
+      expect(counts()).toEqual(before);
+      expect(repo.isProjectTrashed('P1')).toBe(true);
+    });
   });
 });

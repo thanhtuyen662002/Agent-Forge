@@ -94,11 +94,17 @@ export type AgentManagementErrorCode =
   | 'AGENT_ALREADY_REMOVED'
   | 'AGENT_NOT_REMOVED'
   | 'AGENT_HAS_ACTIVE_WORK'
+  | 'AGENT_HAS_AUDIT_LEDGER'
   | 'PROFILE_ALREADY_IN_USE'
   | 'INTERNAL_ERROR';
 
 export type AgentManagementResult =
   | { success: true; agent: ManagedAgent }
+  | { success: false; errorCode: AgentManagementErrorCode; error: string; blockers?: AgentWorkBlocker[] };
+
+/** Permanent deletion of a removed agent (#344); the agent row no longer exists afterwards. */
+export type AgentPurgeResult =
+  | { success: true; agentId: string }
   | { success: false; errorCode: AgentManagementErrorCode; error: string; blockers?: AgentWorkBlocker[] };
 
 /** Read model joining every separated identity an agent is bound to. */
@@ -151,6 +157,7 @@ export type TrashErrorCode =
   | 'NOT_IN_TRASH'
   | 'PROJECT_IN_TRASH'
   | 'HAS_ACTIVE_WORK'
+  | 'PROJECT_HAS_AUDIT_LEDGER'
   | 'INTERNAL_ERROR';
 
 export type TrashMutationResult =

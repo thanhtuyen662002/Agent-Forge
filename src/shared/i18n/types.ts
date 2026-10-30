@@ -326,6 +326,14 @@ export interface TranslationDictionary {
       edit: string;
       remove: string;
       restore: string;
+      purge: string;
+    };
+    purge: {
+      confirmTitle: string;
+      confirmBody: string;
+      confirm: string;
+      cancel: string;
+      purged: string;
     };
     remove: {
       confirmTitle: string;
@@ -353,6 +361,7 @@ export interface TranslationDictionary {
       AGENT_ALREADY_REMOVED: string;
       AGENT_NOT_REMOVED: string;
       AGENT_HAS_ACTIVE_WORK: string;
+      AGENT_HAS_AUDIT_LEDGER: string;
       PROFILE_ALREADY_IN_USE: string;
       INTERNAL_ERROR: string;
       DESKTOP_REQUIRED: string;
@@ -375,6 +384,7 @@ export interface TranslationDictionary {
     tasksHeading: string;
     empty: string;
     restore: string;
+    deletePermanently: string;
     moveToTrash: string;
     showTrash: string;
     hideTrash: string;
@@ -397,8 +407,15 @@ export interface TranslationDictionary {
       confirm: string;
       cancel: string;
     };
+    purge: {
+      title: string;
+      body: string;
+      confirm: string;
+      cancel: string;
+    };
     results: {
       projectTrashed: string;
+      projectPurged: string;
       taskTrashed: string;
       projectRestored: string;
       taskRestored: string;
@@ -420,6 +437,7 @@ export interface TranslationDictionary {
       NOT_IN_TRASH: string;
       PROJECT_IN_TRASH: string;
       HAS_ACTIVE_WORK: string;
+      PROJECT_HAS_AUDIT_LEDGER: string;
       INTERNAL_ERROR: string;
       DESKTOP_REQUIRED: string;
       INVALID_RESPONSE: string;

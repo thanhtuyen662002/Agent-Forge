@@ -70,6 +70,8 @@ export interface OrchestratorApi {
   updateAgent: (data: Record<string, unknown>) => Promise<any>;
   removeAgent: (agentId: string) => Promise<any>;
   restoreAgent: (agentId: string) => Promise<any>;
+  /** Permanently deletes a removed agent (#344). */
+  purgeAgent: (agentId: string) => Promise<any>;
   getTrash: () => Promise<any>;
   getAutomationStatus: () => Promise<any>;
   getManagerDecisions: (projectId: string) => Promise<any>;
@@ -100,6 +102,8 @@ export interface OrchestratorApi {
   setQuotaPreferences: (preferences: { unofficialReaders: boolean }) => Promise<any>;
   trashProject: (projectId: string) => Promise<any>;
   restoreProject: (projectId: string) => Promise<any>;
+  /** Permanently deletes a project that is in the trash (#344). */
+  purgeProject: (projectId: string) => Promise<any>;
   trashTask: (taskId: string) => Promise<any>;
   restoreTask: (taskId: string) => Promise<any>;
   getProviderResources: () => Promise<any[]>;
@@ -223,6 +227,7 @@ const api: OrchestratorApi = {
   updateAgent: (data) => ipcRenderer.invoke('agents:update', data),
   removeAgent: (agentId: string) => ipcRenderer.invoke('agents:remove', { agentId }),
   restoreAgent: (agentId: string) => ipcRenderer.invoke('agents:restore', { agentId }),
+  purgeAgent: (agentId: string) => ipcRenderer.invoke('agents:purge', { agentId }),
   getTrash: () => ipcRenderer.invoke('trash:list'),
   getAutomationStatus: () => ipcRenderer.invoke('automation:status'),
   getManagerDecisions: (projectId: string) => ipcRenderer.invoke('automation:managerDecisions', { projectId }),
@@ -252,6 +257,7 @@ const api: OrchestratorApi = {
   setQuotaPreferences: (preferences: { unofficialReaders: boolean }) => ipcRenderer.invoke('quota:setPreferences', preferences),
   trashProject: (projectId: string) => ipcRenderer.invoke('trash:project', { projectId }),
   restoreProject: (projectId: string) => ipcRenderer.invoke('trash:restoreProject', { projectId }),
+  purgeProject: (projectId: string) => ipcRenderer.invoke('trash:purgeProject', { projectId }),
   trashTask: (taskId: string) => ipcRenderer.invoke('trash:task', { taskId }),
   restoreTask: (taskId: string) => ipcRenderer.invoke('trash:restoreTask', { taskId }),
   getProviderResources: () => ipcRenderer.invoke('providers:listResources'),

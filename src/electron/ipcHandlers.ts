@@ -1018,6 +1018,11 @@ export function registerIpcHandlers(
     return sanitizeOutputValue(workspaceManagementService.restoreAgent(payload));
   });
 
+  // Permanent deletion is an owner-only UI action and never MCP-invokable (#344).
+  registerPrivilegedHandler('agents:purge', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.purgeAgent(payload));
+  });
+
   // Desktop runtime status and read-only quota telemetry.
   registerPrivilegedHandler('automation:status', async () => {
     if (!runtime.automation) return { success: false, errorCode: 'AUTOMATION_UNAVAILABLE' };
@@ -1239,7 +1244,7 @@ export function registerIpcHandlers(
     return { success: true };
   });
 
-  // Owner trash for projects and tasks: reversible, history-preserving.
+  // Owner trash for projects and tasks: reversible and history-preserving until the owner deletes a project permanently.
   registerPrivilegedHandler('trash:list', async () => {
     return sanitizeOutputValue(workspaceManagementService.listTrash());
   });
@@ -1250,6 +1255,11 @@ export function registerIpcHandlers(
 
   registerPrivilegedHandler('trash:restoreProject', async (_, payload: unknown) => {
     return sanitizeOutputValue(workspaceManagementService.restoreProject(payload));
+  });
+
+  // Permanent deletion is an owner-only UI action and never MCP-invokable (#344).
+  registerPrivilegedHandler('trash:purgeProject', async (_, payload: unknown) => {
+    return sanitizeOutputValue(workspaceManagementService.purgeProject(payload));
   });
 
   registerPrivilegedHandler('trash:task', async (_, payload: unknown) => {

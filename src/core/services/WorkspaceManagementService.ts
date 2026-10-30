@@ -15,6 +15,7 @@ import type {
   AgentConnectionKind,
   AgentManagementErrorCode,
   AgentManagementResult,
+  AgentPurgeResult,
   AgentRosterEntry,
   AgentWorkBlocker,
   ManagedAgent,
@@ -78,7 +79,9 @@ class AgentManagementError extends Error {
  * Owner-facing agent roster management. Creating an agent provisions the
  * separated role/profile/provider/account/resource/slot identities in one
  * immediate transaction. Removal only parks an idle agent off the active
- * roster; durable history that references it is never deleted.
+ * roster; durable history that references it is never deleted. Permanent
+ * deletion of a removed agent (#344) drops only the agent row and its unused
+ * profile; history keeps a NULL reference.
  */
 export class WorkspaceManagementService {
   constructor(
@@ -401,6 +404,37 @@ export class WorkspaceManagementService {
     });
   }
 
+  /**
+   * Permanently deletes a removed agent (#344). History rows keep a NULL
+   * reference; its provider resource, account and worker slots stay as
+   * removeAgent left them because execution history still references them.
+   */
+  public purgeAgent(payload: unknown): AgentPurgeResult {
+    const parsed = AgentIdIpcSchema.safeParse(payload);
+    if (!parsed.success) return { success: false, errorCode: 'INVALID_INPUT', error: parsed.error.issues.map((i) => i.message).join(', ') || 'Invalid agent input.' };
+    try {
+      return this.repo.runInImmediateTransaction((): AgentPurgeResult => {
+        const agent = this.requireAgent(parsed.data.agentId);
+        if (!agent.removed_at) throw new AgentManagementError('AGENT_NOT_REMOVED', 'Remove the agent before deleting it permanently.');
+        const blockers = this.repo.getAgentActiveWorkBlockers(agent.id, this.now()) as AgentWorkBlocker[];
+        if (blockers.length > 0) {
+          throw new AgentManagementError('AGENT_HAS_ACTIVE_WORK', 'The agent still has active work and cannot be deleted.', blockers);
+        }
+        if (this.repo.agentHasReviewerLedger(agent.id)) {
+          throw new AgentManagementError('AGENT_HAS_AUDIT_LEDGER', 'The agent reviewed work kept in the permanent audit record.');
+        }
+        this.repo.deleteAgent(agent.id);
+        if (agent.agent_profile_id) this.repo.deleteUnusedAgentProfile(agent.agent_profile_id);
+        return { success: true, agentId: agent.id };
+      });
+    } catch (err) {
+      if (err instanceof AgentManagementError) {
+        return { success: false, errorCode: err.errorCode, error: err.message, ...(err.blockers ? { blockers: err.blockers } : {}) };
+      }
+      return { success: false, errorCode: 'INTERNAL_ERROR', error: 'The agent could not be deleted.' };
+    }
+  }
+
   // ==========================================
   // Project / task trash
   // ==========================================
@@ -443,15 +477,7 @@ export class WorkspaceManagementService {
       const blockers: TrashBlocker[] = [];
       if (PROJECT_ACTIVE_STATUSES.has(project.status)) blockers.push({ code: 'PROJECT_RUNNING', reference: project.status });
       const tasks = this.repo.getTasksByProject(project.id);
-      for (const task of tasks) {
-        // A task already in the trash (such as the APPROVED planning record, #245)
-        // is not active work by its state; live leases or executions still block.
-        const trashed = this.repo.isTaskTrashed(task.id);
-        for (const blocker of this.repo.getTaskTrashBlockers(task.id) as TrashBlocker[]) {
-          if (trashed && blocker.code === 'TASK_ACTIVE_STATE') continue;
-          blockers.push({ ...blocker, taskId: task.id });
-        }
-      }
+      blockers.push(...this.projectTaskBlockers(project.id, !PROJECT_ACTIVE_STATUSES.has(project.status)));
       if (blockers.length > 0) throw new TrashError('HAS_ACTIVE_WORK', 'The project still has active work.', blockers);
 
       let invalidated = 0;
@@ -474,6 +500,51 @@ export class WorkspaceManagementService {
       this.events().record(project.id, 'PROJECT_RESTORED', `Owner restored project "${project.name}" from the trash.`);
       return { success: true, entityType: 'PROJECT', entityId: project.id, invalidatedAuthorizations: 0 };
     });
+  }
+
+  /**
+   * Permanently deletes a trashed project and all of its Agent Forge records
+   * (#344). Files in the owner's repository and managed worktrees on disk are
+   * left untouched. A project with rows in an append-only audit ledger is
+   * refused, since those ledgers forbid deletion.
+   */
+  public purgeProject(payload: unknown): TrashMutationResult {
+    const parsed = ProjectTrashIpcSchema.safeParse(payload);
+    if (!parsed.success) return this.trashInvalid(parsed.error.issues.map((i) => i.message).join(', '));
+    return this.trashMutate(() => {
+      const project = this.repo.getProjectMetadata(parsed.data.projectId);
+      if (!project) throw new TrashError('PROJECT_NOT_FOUND', `Project "${parsed.data.projectId}" was not found.`);
+      if (!this.repo.isProjectTrashed(project.id)) throw new TrashError('NOT_IN_TRASH', 'Only a project in the trash can be deleted permanently.');
+
+      const blockers: TrashBlocker[] = [];
+      if (PROJECT_ACTIVE_STATUSES.has(project.status)) blockers.push({ code: 'PROJECT_RUNNING', reference: project.status });
+      blockers.push(...this.projectTaskBlockers(project.id, !PROJECT_ACTIVE_STATUSES.has(project.status)));
+      if (blockers.length > 0) throw new TrashError('HAS_ACTIVE_WORK', 'The project still has active work.', blockers);
+      if (this.repo.projectHasAuditLedger(project.id)) {
+        throw new TrashError('PROJECT_HAS_AUDIT_LEDGER', 'The project has submitted work kept in the permanent audit record.');
+      }
+
+      this.repo.purgeProjectRows(project.id);
+      return { success: true, entityType: 'PROJECT', entityId: project.id, invalidatedAuthorizations: 0 };
+    });
+  }
+
+  /**
+   * Runtime blockers of a project's tasks. A task's state alone does not block
+   * when it is already in the trash (such as the APPROVED planning record,
+   * #245) or when the project is not running (#344): nothing picks up tasks of
+   * a paused project. Live leases, assignments, executions and agents always block.
+   */
+  private projectTaskBlockers(projectId: string, ignoreTaskState: boolean): TrashBlocker[] {
+    const blockers: TrashBlocker[] = [];
+    for (const task of this.repo.getTasksByProject(projectId)) {
+      const skipState = ignoreTaskState || this.repo.isTaskTrashed(task.id);
+      for (const blocker of this.repo.getTaskTrashBlockers(task.id) as TrashBlocker[]) {
+        if (skipState && blocker.code === 'TASK_ACTIVE_STATE') continue;
+        blockers.push({ ...blocker, taskId: task.id });
+      }
+    }
+    return blockers;
   }
 
   public trashTask(payload: unknown): TrashMutationResult {
