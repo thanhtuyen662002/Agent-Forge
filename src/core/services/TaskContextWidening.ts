@@ -42,7 +42,9 @@ export function widenTaskContext(repo: Repository, projectId: string, taskId: st
     }
   }
   if (candidates.length === 0) return [];
-  const check = validateContextPaths(root, [...current, ...candidates]);
+  // Planned paths the coder has not created yet stay valid (#330); every candidate was found on
+  // disk above. Without this, one planned "electron" folder disabled all widening (VidFlow M8.4, #360).
+  const check = validateContextPaths(root, [...current, ...candidates], { allowMissing: true });
   if (!check.ok) return [];
   repo.setTaskContextPaths(projectId, taskId, check.paths);
   return candidates;
