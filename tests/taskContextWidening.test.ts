@@ -37,6 +37,16 @@ describe('task context widening', () => {
     expect(widenTaskContext(repo(), 'P', 'T', ['src/cli.ts'])).toEqual([]); // Already there.
   });
 
+  it('adds documentation and config files a blocker names (#349)', () => {
+    write('docs/PLAN.md');
+    write('docs/milestones/M5.md');
+    write('config/flow-selectors.yml');
+    const added = widenTaskContext(repo(), 'P', 'T', [
+      'Workspace thiếu docs/PLAN.md, trong khi AGENTS.md yêu cầu đọc trước', 'cần docs/milestones/M5.md và config/flow-selectors.yml',
+    ]);
+    expect(added).toEqual(['docs/PLAN.md', 'docs/milestones/M5.md', 'config/flow-selectors.yml']); // AGENTS.md does not exist here.
+  });
+
   it('never adds paths outside the repository, dependencies, or anything for a task without explicit context', () => {
     write('node_modules/pkg/index.js');
     expect(widenTaskContext(repo(), 'P', 'T', ['../outside.ts', 'node_modules/pkg/index.js', '.git/config.json'])).toEqual([]);
