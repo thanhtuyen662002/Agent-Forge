@@ -37,6 +37,12 @@ const VERIFICATION_PASSED_EVENT = 'AUTOMATION_VERIFICATION_PASSED';
 const MAX_REVIEW_DIFF_BYTES = 256 * 1024;
 /** A review that could not start is offered again after this delay. */
 const REVIEW_RETRY_AFTER_MS = 5 * 60_000;
+/** How often the same verified work may be reviewed without a verdict before it waits for the owner (#356). */
+export const MAX_REVIEW_RETRIES = 3;
+/** A review without a verdict is retried only after this delay, so a failing provider is not hammered. */
+const REVIEW_REQUEUE_AFTER_MS = 60_000;
+/** Failures a new review of the same work cannot fix. */
+const NOT_RETRYABLE_REVIEW_FAILURES = new Set(['REVIEW_DIFF_TOO_LARGE', 'PROCESS_NOT_PROVEN_STOPPED']);
 
 export interface ReviewerCandidate {
   agentId: string;
@@ -73,8 +79,9 @@ interface VerifiedWork {
  * read-only isolated copy of the verified worktree. Only a well-formed
  * review.v1 verdict for the exact verified (headSha, snapshotSha) and task
  * revision is applied, through TaskService.transitionAuthorizedTask. Provider
- * failures, malformed or stale verdicts are recorded and never become PASS.
- * Nothing is merged; there is no automatic retry.
+ * failures, malformed or stale verdicts are recorded and never become PASS;
+ * a review without a verdict is requeued a bounded number of times (#356).
+ * Nothing is merged.
  */
 export class ProductReviewService {
   private readonly now: () => Date;
@@ -110,7 +117,8 @@ export class ProductReviewService {
 
   /** The verified work a review of this task would be bound to, or null. */
   public verifiedWork(task: Task): VerifiedWork | null {
-    if (task.state !== 'REVIEW_READY' || this.repo.isTaskTrashed(task.id)) return null;
+    if (this.repo.isTaskTrashed(task.id)) return null;
+    if (task.state !== 'REVIEW_READY' && !(task.state === 'REVIEWING' && this.reviewRetryDue(task))) return null;
     const passed = this.repo.getProjectEventsOfTypes(task.project_id, [VERIFICATION_PASSED_EVENT], task.id)
       .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
     for (const event of passed) {
@@ -124,17 +132,51 @@ export class ProductReviewService {
   }
 
   /**
-   * Verified, REVIEW_READY work at the current revision that no review has
+   * A review that ended without a verdict (its lease cut by a pause or restart, a provider
+   * failure, an unreadable verdict) left its task in REVIEWING with nothing to pick it up
+   * (VidFlow M6.5: REVIEW_LEASE_OR_FENCE_LOST after the owner paused, #356). The same
+   * verified work is reviewed again, from REVIEWING, once no review attempt of the task
+   * still runs, the failure is a minute old and could change on a new run, and fewer than
+   * MAX_REVIEW_RETRIES reviews of that work have failed. Re-entering REVIEW_READY is not
+   * possible: the identical START_REVIEW binding of the same revision would be refused.
+   */
+  private reviewRetryDue(task: Task): boolean {
+    const own = this.reviewEvents(task.project_id).filter((event) => event.task_id === task.id)
+      .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    const latest = own[0];
+    if (latest?.type !== REVIEW_FAILED_EVENT && latest?.type !== REVIEW_INTERRUPTED_EVENT) return false;
+    const payload = (latest.structured_payload ?? {}) as { reasonCode?: unknown; verificationEventId?: unknown };
+    if (typeof payload.reasonCode === 'string' && NOT_RETRYABLE_REVIEW_FAILURES.has(payload.reasonCode)) return false;
+    if (Date.parse(latest.timestamp) + REVIEW_REQUEUE_AFTER_MS > this.now().getTime()) return false;
+    const failures = own.filter((event) => (event.type === REVIEW_FAILED_EVENT || event.type === REVIEW_INTERRUPTED_EVENT) &&
+      (event.structured_payload as { verificationEventId?: unknown } | null)?.verificationEventId === payload.verificationEventId).length;
+    if (failures >= MAX_REVIEW_RETRIES) return false;
+    return !this.repo.getTaskAttemptsByTask(task.id).some((attempt) => attempt.status === 'RUNNING' && attempt.summary === REVIEW_ATTEMPT_MARKER);
+  }
+
+  /**
+   * Verified work (REVIEW_READY, or REVIEWING with a retry due) at the current revision that no review has
    * started (or conclusively ended) for. `deferred` is true while a review
    * that could not start waits for its retry delay.
    */
   public pendingReview(projectId: string): { task: Task; work: VerifiedWork; deferred: boolean } | null {
-    const started = new Set(this.reviewEvents(projectId)
-      .filter((event) => event.type === REVIEW_STARTED_EVENT || event.type === REVIEW_STALE_EVENT || event.type === REVIEW_FAILED_EVENT)
-      .map((event) => (event.structured_payload as { verificationEventId?: unknown } | null)?.verificationEventId));
+    // Verified work is consumed by a verdict or a stale result. After a review that
+    // ended without one, the same work is offered again (#356, see reviewRetryDue)
+    // until MAX_REVIEW_RETRIES reviews of it have failed.
+    const events = this.reviewEvents(projectId);
+    const consumed = new Set<unknown>();
+    const failures = new Map<unknown, number>();
+    for (const event of events) {
+      const verification = (event.structured_payload as { verificationEventId?: unknown } | null)?.verificationEventId;
+      if (event.type === REVIEW_STALE_EVENT || REVIEW_VERDICT_EVENTS.includes(event.type)) consumed.add(verification);
+      if (event.type === REVIEW_FAILED_EVENT || event.type === REVIEW_INTERRUPTED_EVENT) {
+        failures.set(verification, (failures.get(verification) ?? 0) + 1);
+        if ((failures.get(verification) ?? 0) >= MAX_REVIEW_RETRIES) consumed.add(verification);
+      }
+    }
     for (const task of this.repo.getTasksByProject(projectId)) {
       const work = this.verifiedWork(task);
-      if (work && !started.has(work.verificationEventId)) {
+      if (work && !consumed.has(work.verificationEventId)) {
         return { task, work, deferred: (this.retryAfter.get(work.verificationEventId) ?? 0) > this.now().getTime() };
       }
     }
@@ -173,7 +215,9 @@ export class ProductReviewService {
     };
 
     // 1. The task, project and verified work must still be exactly what was verified.
-    const precheck = this.fenceReason(taskId, 'REVIEW_READY', auth);
+    // A retry (#356) reviews the same work again from REVIEWING.
+    const startState = this.repo.getTask(taskId)?.state === 'REVIEWING' ? 'REVIEWING' : 'REVIEW_READY';
+    const precheck = this.fenceReason(taskId, startState, auth);
     if (precheck) return { outcome: 'NOT_RUN', reasonCode: precheck };
     const coderAssignment = this.repo.getAgentAssignment(auth.assignment_id!);
     if (!coderAssignment?.selected_worker_slot_id) return terminal(REVIEW_STALE_EVENT, 'EXECUTION_SCOPE_INVALID');
@@ -253,8 +297,8 @@ export class ProductReviewService {
       }
 
       // 3. Re-check every fence, then mark the task REVIEWING before the reviewer runs.
-      const fenced = this.fenceReason(taskId, 'REVIEW_READY', auth);
-      if (fenced || !this.transition(taskId, 'START_REVIEW')) {
+      const fenced = this.fenceReason(taskId, startState, auth);
+      if (fenced || (startState === 'REVIEW_READY' && !this.transition(taskId, 'START_REVIEW'))) {
         finish('FAILED');
         return notStarted(fenced ?? 'TASK_TRANSITION_REJECTED');
       }

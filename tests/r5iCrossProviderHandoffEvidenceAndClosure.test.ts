@@ -93,7 +93,8 @@ class MockClosureAdapter implements ProviderAdapter {
   public async cancel(): Promise<void> {}
 }
 
-describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', () => {
+// Real worktree preparation on Windows CI runners can exceed the 30 s default (#356).
+describe('R5I7 Cross-Provider Handoff Evidence and Closure Integration Suite', { timeout: 120_000 }, () => {
   let testDir: string;
   let repoDir: string;
   let managedDir: string;

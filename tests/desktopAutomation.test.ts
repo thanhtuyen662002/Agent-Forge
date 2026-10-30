@@ -704,7 +704,7 @@ describe('desktop automation runtime', () => {
       expect(adapterCalls).toBe(1);
     }, 120_000);
 
-    it('never applies a malformed verdict and does not retry it', async () => {
+    it('never applies a malformed verdict and does not retry it at once', async () => {
       reviewReply = (request) => ({ executionId: request.runtimeBinding!.executionId!, status: 'COMPLETED', outputProtocol: '{"protocol":"coder.v1"}' });
       const { task } = await runToReview();
 
@@ -751,6 +751,39 @@ describe('desktop automation runtime', () => {
       await service.drain();
       expect(reviewRequests).toHaveLength(1);
     }, 120_000);
+
+    it('reviews the same verified work again after a review ended without a verdict (#356)', async () => {
+      // An unreadable verdict ends the review without one (a provider AUTH_ERROR would also mark the account unhealthy).
+      reviewReply = (request) => ({ executionId: request.runtimeBinding!.executionId!, status: 'COMPLETED', outputProtocol: '{"protocol":"coder.v1"}' });
+      const { task } = await runToReview();
+      expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
+
+      // Not at once: a failing provider is not hammered.
+      await service.tick();
+      await service.drain();
+      expect(reviewRequests).toHaveLength(1);
+      // A minute later the next pass reviews the same verified work again.
+      clock += 61_000;
+      reviewReply = verdict('PASS');
+      await service.tick();
+      await service.drain();
+      expect(reviewRequests).toHaveLength(2);
+      expect(repo.getTask(task.id)).toMatchObject({ state: 'DONE', revision_count: task.revision_count });
+      expect(adapterCalls).toBe(1); // The coder was not run again.
+    }, 120_000);
+
+    it('stops reviewing the same work after three reviews without a verdict (#356)', async () => {
+      reviewReply = (request) => ({ executionId: request.runtimeBinding!.executionId!, status: 'COMPLETED', outputProtocol: '{"protocol":"coder.v1"}' });
+      const { task } = await runToReview();
+      for (let round = 0; round < 4; round += 1) {
+        clock += 61_000;
+        await service.tick();
+        await service.drain();
+      }
+      expect(reviewRequests).toHaveLength(3);
+      expect(eventsOf('AUTOMATION_REVIEW_FAILED')).toHaveLength(3);
+      expect(repo.getTask(task.id)).toMatchObject({ state: 'REVIEWING', revision_count: task.revision_count });
+    }, 180_000);
 
     it('releases a task left in REVIEWING by a BLOCKED verdict from before #308 (#310)', async () => {
       const task = await approvedTask();
@@ -1035,23 +1068,29 @@ describe('desktop automation runtime', () => {
       expect(repo.getActiveLeaseForAssignment(assignment.id)).not.toBeNull();
       expect(eventsOf('AUTOMATION_REVIEW_INTERRUPTED')[0].structured_payload).toMatchObject({ reasonCode: 'PROCESS_NOT_PROVEN_STOPPED' });
 
-      // (b) Once the process is terminal, the expired lease is released and the attempt ends; no verdict, no retry.
+      // (b) Once the process is terminal, the expired lease is released and the attempt ends without a
+      // verdict. The same verified work is then reviewed again (#356), on a new attempt.
       db.prepare("UPDATE process_runs SET status = 'FAILED' WHERE id = ?").run(executionId);
+      reviewReply = verdict('FIX_REQUIRED');
       await restarted.tick();
       await restarted.drain();
       expect(repo.getTaskAttempt(attempt.id)!.status).toBe('FAILED');
       expect(repo.getAgentAssignment(assignment.id)!.status).toBe('FAILED');
       expect(repo.getActiveLeaseForAssignment(assignment.id)).toBeNull();
       expect(eventsOf('AUTOMATION_REVIEW_INTERRUPTED').some((e) => (e.structured_payload as any).reasonCode === 'REVIEW_INTERRUPTED')).toBe(true);
-      expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
-      expect(repo.getReviewsByTask(task.id)).toEqual([]);
-      expect(reviewRequests).toHaveLength(1);
+      await restarted.tick();
+      await restarted.drain();
+      expect(reviewRequests).toHaveLength(2);
+      const reviews = repo.getReviewsByTask(task.id);
+      expect(reviews).toHaveLength(1);
+      expect(reviews[0]).toMatchObject({ verdict: 'FIX_REQUIRED' });
+      expect(reviews[0].attempt_id).not.toBe(attempt.id);
 
-      // The old process's late result is not applied either.
+      // The old process's late PASS is never applied.
       finishHung(verdict('PASS')(reviewRequests[0]));
       await first.drain();
-      expect(repo.getTask(task.id)!.state).toBe('REVIEWING');
-      expect(repo.getReviewsByTask(task.id)).toEqual([]);
+      expect(repo.getReviewsByTask(task.id)).toHaveLength(1);
+      expect(repo.getTask(task.id)!.state).not.toBe('DONE');
     }, 120_000);
   });
   describe('account-bound automated Manager (#239)', () => {
