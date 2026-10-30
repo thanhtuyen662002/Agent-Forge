@@ -8,7 +8,7 @@ export type TrashActionResult =
 
 const ERROR_CODES = new Set<TrashErrorCode>([
   'INVALID_INPUT', 'PROJECT_NOT_FOUND', 'TASK_NOT_FOUND', 'ALREADY_IN_TRASH',
-  'NOT_IN_TRASH', 'PROJECT_IN_TRASH', 'HAS_ACTIVE_WORK', 'INTERNAL_ERROR',
+  'NOT_IN_TRASH', 'PROJECT_IN_TRASH', 'HAS_ACTIVE_WORK', 'PROJECT_HAS_AUDIT_LEDGER', 'INTERNAL_ERROR',
 ]);
 const BLOCKER_CODES = new Set<TrashBlockerCode>([
   'PROJECT_RUNNING', 'TASK_ACTIVE_STATE', 'ACTIVE_TASK_LEASE', 'ACTIVE_ASSIGNMENT', 'IN_FLIGHT_EXECUTION', 'AGENT_ASSIGNED',
@@ -125,6 +125,7 @@ export function useWorkspaceTrash(afterMutation: () => Promise<void>) {
     reload,
     trashProject: (projectId: string) => mutate('PROJECT', projectId, () => api.trashProject(projectId)),
     restoreProject: (projectId: string) => mutate('PROJECT', projectId, () => api.restoreProject(projectId)),
+    purgeProject: (projectId: string) => mutate('PROJECT', projectId, () => api.purgeProject(projectId)),
     trashTask: (taskId: string) => mutate('TASK', taskId, () => api.trashTask(taskId)),
     restoreTask: (taskId: string) => mutate('TASK', taskId, () => api.restoreTask(taskId)),
   };

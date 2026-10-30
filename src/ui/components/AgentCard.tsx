@@ -3,7 +3,7 @@ import { ProviderResource, Task } from '../../core/types/domain';
 import type { AgentRosterEntry, ManagedAgent } from '../../core/types/workspace';
 import { useI18n } from '../context/I18nContext';
 import { QuotaBadge } from './QuotaBadge';
-import { Bot, Terminal, Shield, ArrowUpRight, Pencil, Trash2, RotateCcw, Wrench, LogIn } from 'lucide-react';
+import { Bot, Terminal, Shield, ArrowUpRight, Pencil, Trash2, RotateCcw, Wrench, LogIn, XCircle } from 'lucide-react';
 
 interface AgentCardProps {
   agent: ManagedAgent;
@@ -16,6 +16,8 @@ interface AgentCardProps {
   onEdit?: () => void;
   onRemove?: () => void;
   onRestore?: () => void;
+  /** Permanent delete, offered only for a removed agent (#344). */
+  onPurge?: () => void;
   /** Offered for Codex CLI agents whose account is not yet proven signed in. */
   onSignIn?: () => void;
 }
@@ -30,6 +32,7 @@ export const AgentCard: React.FC<AgentCardProps> = ({
   onEdit,
   onRemove,
   onRestore,
+  onPurge,
   onSignIn,
 }) => {
   const { t } = useI18n();
@@ -205,20 +208,34 @@ export const AgentCard: React.FC<AgentCardProps> = ({
         </div>
       )}
 
-      {(onEdit || onRemove || onRestore) && (
+      {(onEdit || onRemove || onRestore || onPurge) && (
         <div className="flex items-center justify-end gap-2 pt-2 border-t border-surface-border/60">
           {removed ? (
-            onRestore && (
-              <button
-                type="button"
-                onClick={onRestore}
-                disabled={actionsDisabled}
-                className="px-3 py-1.5 rounded-lg text-xs font-medium bg-forge-cyan/15 text-forge-cyan border border-forge-cyan/40 hover:bg-forge-cyan/25 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
-              >
-                <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
-                <span>{t('agentCenter.actions.restore')}</span>
-              </button>
-            )
+            <>
+              {onRestore && (
+                <button
+                  type="button"
+                  onClick={onRestore}
+                  disabled={actionsDisabled}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium bg-forge-cyan/15 text-forge-cyan border border-forge-cyan/40 hover:bg-forge-cyan/25 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>{t('agentCenter.actions.restore')}</span>
+                </button>
+              )}
+              {onPurge && (
+                <button
+                  type="button"
+                  onClick={onPurge}
+                  disabled={actionsDisabled}
+                  aria-label={`${t('agentCenter.actions.purge')}: ${agent.display_name}`}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium bg-rose-950/40 border border-rose-800/60 text-rose-300 hover:bg-rose-900/40 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5"
+                >
+                  <XCircle className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>{t('agentCenter.actions.purge')}</span>
+                </button>
+              )}
+            </>
           ) : (
             <>
               {onEdit && (

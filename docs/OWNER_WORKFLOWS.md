@@ -91,6 +91,22 @@ these:
 - an unreleased account lease on one of its slots (expired leases still block
   until recovery releases them).
 
+### Delete a removed agent permanently
+
+A removed agent's card also offers **Delete permanently** (#344). After a
+confirmation that says it cannot be undone, `agents:purge` re-checks the
+blockers above, deletes the `agents` row and deletes its agent profile when no
+other agent uses it. History keeps its rows with a `NULL` agent reference
+(those foreign keys are `ON DELETE SET NULL`). The provider account, resource
+and worker slots are kept as removal left them, because execution history
+still references them. A deleted default agent is not seeded again on the next
+start: startup seeds a default agent only together with its resource.
+
+It is refused with `AGENT_NOT_REMOVED` for an agent still on the roster, with
+`AGENT_HAS_ACTIVE_WORK` while a blocker remains, and with
+`AGENT_HAS_AUDIT_LEDGER` when the agent appears in the append-only reviewer
+session ledger, which forbids deletion.
+
 ### IPC surface
 
 All channels go through the trusted-sender check and sanitize their output.
@@ -102,6 +118,7 @@ All channels go through the trusted-sender check and sanitize their output.
 | `agents:update` | `UpdateAgentIpcSchema` | same |
 | `agents:remove` | `{ agentId }` | same |
 | `agents:restore` | `{ agentId }` | same |
+| `agents:purge` | `{ agentId }` | `{ success: true, agentId }` or `{ success: false, errorCode, error, blockers? }` |
 
 The renderer (`src/ui/agentRoster.ts`) only treats a reply as saved when it is
 an explicit success envelope that carries the persisted agent. Malformed
@@ -168,7 +185,10 @@ so it is refused with the reason. Trash is also refused while the task has an
 unreleased task lease, an `ASSIGNED`/`RUNNING` assignment, an execution whose
 adapter started and has not finished, or an agent working on it. A project is
 refused while it is `RUNNING`, `FINAL_REVIEW` or `WAITING_FOR_CAPACITY`, or
-while any of its tasks has one of these blockers; every blocker is listed.
+while any of its tasks has one of the runtime blockers (lease, assignment,
+in-flight execution, working agent); every blocker is listed. Task states do
+not block a project that is not running (#344): pausing a project leaves its
+tasks `PAUSED`, and nothing picks up tasks of a paused project.
 
 Trashed items leave `project:list` and `task:list` (tasks of a trashed project
 are hidden too). If the selected project is trashed, the app selects the first
@@ -190,8 +210,28 @@ the trash before claiming an authorization.
 | `trash:list` | none | `{ projects, tasks }` |
 | `trash:project` / `trash:restoreProject` | `{ projectId }` | `{ success: true, entityType, entityId, invalidatedAuthorizations }` or `{ success: false, errorCode, error, blockers? }` |
 | `trash:task` / `trash:restoreTask` | `{ taskId }` | same |
+| `trash:purgeProject` | `{ projectId }` | `{ success: true, entityType: 'PROJECT', entityId, invalidatedAuthorizations: 0 }` or `{ success: false, errorCode, error, blockers? }` |
 
-There is no permanent delete.
+### Delete a trashed project permanently
+
+A project in the trash has **Delete permanently** next to **Restore** (#344).
+After a confirmation that says it cannot be undone, `trash:purgeProject`
+re-checks the runtime blockers and deletes every row of the project and its
+tasks in one immediate transaction: execution authorizations and the other
+rows that restrict deletion first, then the `projects` row, whose cascades
+remove the rest. No event is recorded, since the project's events are deleted
+with it. Files in the owner's repository are never touched; managed worktrees
+under the app's worktree folder and stored artifact files are left on disk.
+
+It is refused with `NOT_IN_TRASH` for a project outside the trash, with
+`HAS_ACTIVE_WORK` while a runtime blocker remains, and with
+`PROJECT_HAS_AUDIT_LEDGER` when the project has rows in an append-only audit
+ledger (coder submissions and their dispositions and adjudications, MCP
+submission or reviewer sessions). Those ledgers forbid deletion, so such a
+project stays in the trash unchanged. Tasks have no permanent delete.
+
+`trash:purgeProject` and `agents:purge` are not available to the local MCP
+server; permanent deletion is an owner action in the app only.
 
 ## Automatic coder execution (Start / Pause)
 

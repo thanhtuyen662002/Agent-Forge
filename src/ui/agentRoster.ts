@@ -13,6 +13,11 @@ export type AgentMutationFailureCode = AgentManagementErrorCode | 'DESKTOP_REQUI
 export type AgentMutationResult =
   | { success: true; agent: ManagedAgent }
   | { success: false; code: AgentMutationFailureCode; blockers: AgentWorkBlocker[] };
+type AgentMutationFailure = Extract<AgentMutationResult, { success: false }>;
+/** Outcome of permanently deleting a removed agent (#344); no agent row survives it. */
+export type AgentPurgeOutcome =
+  | { success: true; agentId: string }
+  | { success: false; code: AgentMutationFailureCode; blockers: AgentWorkBlocker[] };
 
 export interface CreateAgentInput {
   displayName: string;
@@ -35,7 +40,7 @@ const ROLES = new Set(['PRIMARY_MANAGER', 'BACKUP_MANAGER', 'CODER', 'REVIEWER',
 const CONNECTIONS = new Set(['MANUAL_BRIDGE', 'CODEX_CLI', 'GEMINI_CLI', 'CLAUDE_CODE_CLI', 'ANTIGRAVITY_CLI', 'OTHER']);
 const ERROR_CODES = new Set<AgentManagementErrorCode>([
   'INVALID_INPUT', 'AGENT_NOT_FOUND', 'AGENT_ALREADY_REMOVED', 'AGENT_NOT_REMOVED',
-  'AGENT_HAS_ACTIVE_WORK', 'PROFILE_ALREADY_IN_USE', 'INTERNAL_ERROR',
+  'AGENT_HAS_ACTIVE_WORK', 'AGENT_HAS_AUDIT_LEDGER', 'PROFILE_ALREADY_IN_USE', 'INTERNAL_ERROR',
 ]);
 const BLOCKER_CODES = new Set<AgentWorkBlockerCode>([
   'CURRENT_TASK', 'AGENT_BUSY', 'REVIEWER_SESSION', 'ACTIVE_ASSIGNMENT',
@@ -71,6 +76,19 @@ export function normalizeAgentMutationReply(reply: unknown): AgentMutationResult
       return blockers ? { success: false, code: reply.errorCode as AgentManagementErrorCode, blockers } : invalid;
     }
     return invalid;
+  } catch {
+    return invalid;
+  }
+}
+
+/** A permanent delete is only confirmed by a success envelope naming the exact agent. */
+export function normalizeAgentPurgeReply(reply: unknown, agentId: string): AgentPurgeOutcome {
+  const invalid: AgentPurgeOutcome = { success: false, code: 'INVALID_RESPONSE', blockers: [] };
+  try {
+    if (!isRecord(reply)) return invalid;
+    if (reply.success === true) return reply.agentId === agentId ? { success: true, agentId } : invalid;
+    const failure = normalizeAgentMutationReply(reply);
+    return failure.success ? invalid : failure;
   } catch {
     return invalid;
   }
@@ -124,15 +142,18 @@ export function useAgentRoster(includeRemoved: boolean, afterMutation: () => Pro
 
   useEffect(() => { void reload(); }, [reload]);
 
-  const mutate = useCallback(async (invoke: () => Promise<unknown>): Promise<AgentMutationResult> => {
+  const mutateWith = useCallback(async <S extends { success: true }>(
+    invoke: () => Promise<unknown>,
+    normalize: (reply: unknown) => S | AgentMutationFailure,
+  ): Promise<S | AgentMutationFailure> => {
     if (!api) return { success: false, code: 'DESKTOP_REQUIRED', blockers: [] };
     if (pendingRef.current) return { success: false, code: 'INTERNAL_ERROR', blockers: [] };
     pendingRef.current = true;
     setPending(true);
     try {
-      let result: AgentMutationResult;
+      let result: S | AgentMutationFailure;
       try {
-        result = normalizeAgentMutationReply(await invoke());
+        result = normalize(await invoke());
       } catch {
         result = { success: false, code: 'INVALID_RESPONSE', blockers: [] };
       }
@@ -147,6 +168,10 @@ export function useAgentRoster(includeRemoved: boolean, afterMutation: () => Pro
       setPending(false);
     }
   }, [api, reload, afterMutation]);
+  const mutate = useCallback(
+    (invoke: () => Promise<unknown>) => mutateWith(invoke, normalizeAgentMutationReply),
+    [mutateWith],
+  );
 
   return {
     available: Boolean(api?.getAgentRoster),
@@ -159,5 +184,6 @@ export function useAgentRoster(includeRemoved: boolean, afterMutation: () => Pro
     updateAgent: (input: UpdateAgentInput) => mutate(() => api.updateAgent(input)),
     removeAgent: (agentId: string) => mutate(() => api.removeAgent(agentId)),
     restoreAgent: (agentId: string) => mutate(() => api.restoreAgent(agentId)),
+    purgeAgent: (agentId: string) => mutateWith(() => api.purgeAgent(agentId), (reply) => normalizeAgentPurgeReply(reply, agentId)),
   };
 }

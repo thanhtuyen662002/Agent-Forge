@@ -56,7 +56,9 @@ export class BootstrapService {
     }
 
     // 2. Initial Provider Resources with UNKNOWN status & unmeasured quota (Truth in Observability)
-    if (!repo.getProviderResource('res-chatgpt-manager')) {
+    const seedManager = !repo.getProviderResource('res-chatgpt-manager');
+    const seedCoder = !repo.getProviderResource('res-gemini-coder');
+    if (seedManager) {
       repo.createProviderResource({
         id: 'res-chatgpt-manager',
         provider_id: 'prov-manual-bridge',
@@ -74,7 +76,7 @@ export class BootstrapService {
       });
     }
 
-    if (!repo.getProviderResource('res-gemini-coder')) {
+    if (seedCoder) {
       repo.createProviderResource({
         id: 'res-gemini-coder',
         provider_id: 'prov-manual-bridge',
@@ -92,8 +94,9 @@ export class BootstrapService {
       });
     }
 
-    // 3. Initial Agents
-    if (!repo.getAgent('agent-primary-manager')) {
+    // 3. Initial Agents, seeded only together with their resource: a default agent the owner
+    // deleted permanently (#344) keeps its resource and must not come back on the next start.
+    if (seedManager && !repo.getAgent('agent-primary-manager')) {
       repo.createAgent({
         id: 'agent-primary-manager',
         display_name: 'ChatGPT Manager (Manual Bridge)',
@@ -105,7 +108,7 @@ export class BootstrapService {
       });
     }
 
-    if (!repo.getAgent('agent-gemini-coder')) {
+    if (seedCoder && !repo.getAgent('agent-gemini-coder')) {
       repo.createAgent({
         id: 'agent-gemini-coder',
         display_name: 'Gemini Coder (Manual Bridge)',
