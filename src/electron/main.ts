@@ -1,4 +1,5 @@
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, powerSaveBlocker } from 'electron';
+import { automationNeedsSystemAwake, KeepAwake } from './keepAwake';
 import path from 'path';
 import fs from 'fs';
 import { BootstrapService, BootstrapResult } from '../core/services/BootstrapService';
@@ -23,6 +24,7 @@ let mainWindow: BrowserWindow | null = null;
 let bootstrapInstance: BootstrapResult | null = null;
 let updateServiceInstance: UpdateService | null = null;
 let automationInstance: DesktopAutomationService | null = null;
+const keepAwake = new KeepAwake(powerSaveBlocker);
 let quotaInstance: AccountQuotaService | null = null;
 let signInInstance: CodexAccountConnectionService | null = null;
 let mcpInstance: AgentForgeMcpServer | null = null;
@@ -241,6 +243,10 @@ app.whenReady().then(() => {
   mcpInstance.attach(ipcRegistry);
   void mcpInstance.start();
   automationInstance.start();
+  // The system stays awake while automation runs a project (#342).
+  const updateKeepAwake = () => { try { keepAwake.update(automationNeedsSystemAwake(automationInstance?.getStatus())); } catch { /* next check */ } };
+  updateKeepAwake();
+  setInterval(updateKeepAwake, 60_000).unref?.();
   quotaInstance.start();
   scheduleUpdateChecks();
   void quotaInstance.refreshAll();
@@ -281,6 +287,7 @@ app.on('before-quit', () => {
   // Stop new dispatch and polling first; in-flight executions keep their
   // durable fences and are reconciled by startup recovery if interrupted.
   automationInstance?.stop();
+  keepAwake.release();
   quotaInstance?.stop();
   signInInstance?.dispose();
   void mcpInstance?.stop();

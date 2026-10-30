@@ -557,6 +557,14 @@ task without explicit context paths is left alone. Additions are recorded as
 **Retry** now also works for a task the Manager `BLOCK`ed. It returns the task
 to `CODING`, and the Manager decides again.
 
+**The PC stays awake while a project runs (#342).** While automation has a
+running project that is not finished, Agent Forge holds an Electron
+`prevent-app-suspension` blocker, so Windows does not sleep in the middle of a
+coder run. The display may still turn off. The blocker is released when no
+project needs it, and on quit. Background: in VidFlow M2–M9 the PC slept
+overnight during a run. The account lease expired, and later tasks failed with
+`STALE_LEASE_REQUIRES_RECOVERY` until the app was restarted.
+
 **Truthful progress and coder failover (#302).** Automated tasks also refresh
 their progress whenever a coder run of the current revision starts, settles or
 fails. The stages are:
