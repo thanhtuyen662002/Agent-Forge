@@ -16,6 +16,7 @@ interface IntegrationEntryView {
 
 const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 const STATES = new Set(['READY', 'BRANCH_CREATED', 'DISCARDED']);
+const REVIEWED_WORK_PREVIEW = 5;
 const SKIP_REASONS = new Set(['MERGE_CONFLICT', 'OWNER_CHECKOUT_HAS_CHANGES', 'DEFAULT_BRANCH_MOVED', 'DEFAULT_BRANCH_MISSING', 'MERGE_FAILED']);
 
 /** Accepts only a well-formed `integration:list` reply; anything else is "unknown". */
@@ -49,6 +50,7 @@ export const ReviewedWorkPanel: React.FC<{ projectId: string }> = ({ projectId }
   const [busy, setBusy] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
   const [autoIntegrate, setAutoIntegrate] = useState<boolean | null>(null);
+  const [expanded, setExpanded] = useState(false);
   const current = useRef(projectId);
   current.current = projectId;
 
@@ -82,6 +84,12 @@ export const ReviewedWorkPanel: React.FC<{ projectId: string }> = ({ projectId }
 
   if (!api?.getIntegrations) return null;
   const list = entries?.projectId === projectId ? entries.list : [];
+  // Work that still needs the owner comes first, then the newest settled work; a long
+  // project (41 tasks) shows only the latest few until the owner asks for all.
+  const needsOwner = (entry: IntegrationEntryView) => entry.state === 'READY' || (entry.state === 'BRANCH_CREATED' && (!entry.mergedInto || entry.leftoverCopy));
+  const ordered = [...list.filter(needsOwner), ...list.filter((entry) => !needsOwner(entry)).reverse()];
+  const visibleCount = expanded ? ordered.length : Math.max(REVIEWED_WORK_PREVIEW, list.filter(needsOwner).length);
+  const visible = ordered.slice(0, visibleCount);
   // The switch stays visible once known, so the owner can opt in before any work is ready.
   if (list.length === 0 && autoIntegrate === null) return null;
 
@@ -134,9 +142,9 @@ export const ReviewedWorkPanel: React.FC<{ projectId: string }> = ({ projectId }
       )}
       {error && <p role="alert" className="text-xs text-rose-300">{error}</p>}
       <ul className="divide-y divide-surface-border">
-        {list.map((entry) => (
+        {visible.map((entry) => (
           <li key={entry.taskId} className="py-3 flex flex-wrap items-center justify-between gap-3">
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <p className="text-sm text-slate-100 font-medium truncate">{entry.taskTitle}</p>
               {entry.state === 'BRANCH_CREATED' && entry.mergedInto && (
                 <p className="text-xs text-emerald-300">{t('runtime.integrationPanel.merged', { branch: entry.mergedInto })}</p>
@@ -190,6 +198,12 @@ export const ReviewedWorkPanel: React.FC<{ projectId: string }> = ({ projectId }
           </li>
         ))}
       </ul>
+      {ordered.length > REVIEWED_WORK_PREVIEW && (
+        <button type="button" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}
+          className="text-xs font-medium text-forge-cyan hover:underline">
+          {expanded ? t('runtime.integrationPanel.showFewer') : t('runtime.integrationPanel.showAll', { count: ordered.length })}
+        </button>
+      )}
     </section>
   );
 };

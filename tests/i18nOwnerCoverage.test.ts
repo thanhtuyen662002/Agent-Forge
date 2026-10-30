@@ -59,7 +59,7 @@ describe('Owner Vietnamese I18n Coverage Contract (PR #11)', () => {
     'src/ui/views/AgentCenterView.tsx',
     'src/ui/views/CapacityView.tsx',
     'src/ui/views/TimelineView.tsx',
-    'src/ui/views/DecisionsView.tsx',
+    'src/ui/components/AuthorityHelp.tsx',
     'src/ui/views/EvidenceView.tsx',
     'src/ui/views/ProjectsView.tsx',
     'src/ui/views/SettingsView.tsx',
