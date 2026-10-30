@@ -47,6 +47,15 @@ describe('task context widening', () => {
     expect(added).toEqual(['docs/PLAN.md', 'docs/milestones/M5.md', 'config/flow-selectors.yml']); // AGENTS.md does not exist here.
   });
 
+  it('still widens a task whose planned context names paths not created yet (#360)', () => {
+    write('src/app/preload.cjs');
+    write('src/service/index.ts');
+    context = ['src/paths.ts', 'electron', 'renderer/App.tsx'];
+    const added = widenTaskContext(repo(), 'P', 'T', ['Thiếu src/app/preload.cjs và src/service/index.ts']);
+    expect(added).toEqual(['src/app/preload.cjs', 'src/service/index.ts']);
+    expect(context).toEqual(['src/paths.ts', 'electron', 'renderer/App.tsx', ...added]);
+  });
+
   it('never adds paths outside the repository, dependencies, or anything for a task without explicit context', () => {
     write('node_modules/pkg/index.js');
     expect(widenTaskContext(repo(), 'P', 'T', ['../outside.ts', 'node_modules/pkg/index.js', '.git/config.json'])).toEqual([]);
