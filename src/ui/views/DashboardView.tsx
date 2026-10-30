@@ -98,13 +98,14 @@ export const DashboardView: React.FC = () => {
     : t('common.unknown');
 
   return (
-    <div className="p-8 space-y-8 max-w-7xl mx-auto overflow-y-auto">
-      <section aria-labelledby="dashboard-setup-title" className="bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl space-y-4">
-        <h3 id="dashboard-setup-title" className="text-base font-semibold text-white flex items-center gap-2.5">
-          <CheckCircle2 aria-hidden="true" className="w-5 h-5 text-forge-cyan" />
-          {t(setupComplete ? 'dashboardGuide.setupComplete' : 'dashboardGuide.title')}
-        </h3>
-        {!setupComplete && (
+    <div className="p-6 lg:p-8 space-y-6 max-w-7xl mx-auto">
+      {/* The setup guide disappears once every step is done. */}
+      {!setupComplete && (
+        <section aria-labelledby="dashboard-setup-title" className="bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl space-y-4">
+          <h3 id="dashboard-setup-title" className="text-base font-semibold text-white flex items-center gap-2.5">
+            <CheckCircle2 aria-hidden="true" className="w-5 h-5 text-forge-cyan" />
+            {t('dashboardGuide.title')}
+          </h3>
           <ul className="space-y-3">
             {setupSteps.map(step => (
               <li key={step.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 bg-surface/60 border border-surface-border rounded-lg">
@@ -127,57 +128,22 @@ export const DashboardView: React.FC = () => {
               </li>
             ))}
           </ul>
-        )}
-      </section>
-
-      {activeProject && <ReviewedWorkPanel projectId={activeProject.id} />}
-      {activeProject && <ManagerDecisionsPanel projectId={activeProject.id} />}
-
-      <section aria-labelledby="dashboard-attention-title" className="bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl space-y-4">
-        <h3 id="dashboard-attention-title" className="text-base font-semibold text-white flex items-center gap-2.5">
-          <AlertTriangle aria-hidden="true" className="w-5 h-5 text-forge-amber" />
-          {t('dashboardGuide.attentionTitle')}
-        </h3>
-        {attentionTasks.length === 0 ? (
-          <p className="text-sm text-slate-400">{t('dashboardGuide.noAttention')}</p>
-        ) : (
-          <ul className="space-y-3">
-            {attentionTasks.map(task => (
-              <li key={task.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 bg-surface/60 border border-surface-border rounded-lg">
-                <div className="min-w-0 space-y-1">
-                  <p className="text-sm font-medium text-slate-200 break-words">{task.title}</p>
-                  <p className="text-xs text-slate-400">{t(`dashboardGuide.reasons.${task.state}`)}</p>
-                </div>
-                <button
-                  type="button"
-                  aria-label={t('dashboardGuide.openTaskLabel', { title: task.title })}
-                  onClick={() => {
-                    setSelectedTaskId(task.id);
-                    setActiveView('task-detail');
-                  }}
-                  className="shrink-0 px-3 py-2 text-xs font-semibold text-forge-cyan bg-forge-cyan/10 hover:bg-forge-cyan/20 border border-forge-cyan/30 rounded-md transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-forge-cyan"
-                >
-                  {t('dashboardGuide.openTask')}
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+        </section>
+      )}
 
       {/* Top Banner / Project Overview */}
       <div className="bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl relative overflow-hidden">
         <div className="absolute top-0 right-0 w-96 h-96 bg-forge-cyan/5 rounded-full blur-3xl -mr-20 -mt-20 pointer-events-none"></div>
 
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6 relative z-10">
-          <div className="space-y-2">
-            <div className="flex items-center space-x-3">
+          <div className="space-y-2 min-w-0">
+            <div className="flex flex-wrap items-center gap-3">
               {activeProject && (
                 <span className="px-2.5 py-1 rounded-md text-xs font-mono font-bold bg-forge-cyan/20 text-forge-cyan border border-forge-cyan/30">
                   {activeProject.id}
                 </span>
               )}
-              <h2 className="text-2xl font-bold text-white tracking-tight">
+              <h2 className="text-2xl font-bold text-white tracking-tight break-words min-w-0">
                 {activeProject?.name || t('header.noProject')}
               </h2>
             </div>
@@ -185,12 +151,12 @@ export const DashboardView: React.FC = () => {
               {activeProject ? activeProject.description : t('dashboard.noProjectDescription')}
             </p>
             {activeProject ? (
-              <div className="flex items-center space-x-6 text-xs font-mono text-slate-400 pt-2">
-                <div className="flex items-center space-x-2">
-                  <GitBranch className="w-4 h-4 text-forge-cyan" />
-                  <span>{t('dashboard.repoLabel')}: <strong className="text-slate-200">{activeProject.repository_path}</strong></span>
+              <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs font-mono text-slate-400 pt-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <GitBranch className="w-4 h-4 text-forge-cyan shrink-0" />
+                  <span className="break-all">{t('dashboard.repoLabel')}: <strong className="text-slate-200">{activeProject.repository_path}</strong></span>
                 </div>
-                <div className="flex items-center space-x-2">
+                <div className="flex items-center gap-2">
                   <ShieldCheck className="w-4 h-4 text-forge-emerald" />
                   <span>{t('dashboard.branchLabel')}: <strong className="text-slate-200">{activeProject.default_branch}</strong></span>
                 </div>
@@ -284,6 +250,87 @@ export const DashboardView: React.FC = () => {
         </div>
       </div>
 
+      <section aria-labelledby="dashboard-attention-title" className="bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl space-y-4">
+        <h3 id="dashboard-attention-title" className="text-base font-semibold text-white flex items-center gap-2.5">
+          <AlertTriangle aria-hidden="true" className="w-5 h-5 text-forge-amber" />
+          {t('dashboardGuide.attentionTitle')}
+        </h3>
+        {attentionTasks.length === 0 ? (
+          <p className="text-sm text-slate-400">{t('dashboardGuide.noAttention')}</p>
+        ) : (
+          <ul className="space-y-3">
+            {attentionTasks.map(task => (
+              <li key={task.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 bg-surface/60 border border-surface-border rounded-lg">
+                <div className="min-w-0 space-y-1">
+                  <p className="text-sm font-medium text-slate-200 break-words">{task.title}</p>
+                  <p className="text-xs text-slate-400">{t(`dashboardGuide.reasons.${task.state}`)}</p>
+                </div>
+                <button
+                  type="button"
+                  aria-label={t('dashboardGuide.openTaskLabel', { title: task.title })}
+                  onClick={() => {
+                    setSelectedTaskId(task.id);
+                    setActiveView('task-detail');
+                  }}
+                  className="shrink-0 px-3 py-2 text-xs font-semibold text-forge-cyan bg-forge-cyan/10 hover:bg-forge-cyan/20 border border-forge-cyan/30 rounded-md transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-forge-cyan"
+                >
+                  {t('dashboardGuide.openTask')}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {/* Reviewed work beside the live activity, so neither pushes the rest off screen. */}
+      <div className="grid grid-cols-1 xl:grid-cols-5 gap-6 items-start">
+        {activeProject && <div className="xl:col-span-3 min-w-0"><ReviewedWorkPanel projectId={activeProject.id} /></div>}
+        {/* Live activity */}
+        <div className={`${activeProject ? 'xl:col-span-2' : 'xl:col-span-5'} min-w-0 bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg space-y-4`}>
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold text-white font-mono uppercase tracking-wider flex items-center space-x-2">
+              <Clock className="w-4 h-4 text-forge-cyan" />
+              <span>{t('dashboard.liveStreamTitle')}</span>
+            </h3>
+            <button
+              type="button"
+              onClick={() => setActiveView('timeline')}
+              className="text-xs font-mono text-forge-cyan hover:underline"
+            >
+              {t('dashboard.fullTimeline')}
+            </button>
+          </div>
+
+          <div className="space-y-3 max-h-80 overflow-y-auto pr-1">
+            {events.length === 0 ? (
+              <div className="text-xs text-slate-500 font-mono py-6 text-center">
+                {t('dashboard.noEvents')}
+              </div>
+            ) : (
+              events.slice(0, 6).map((ev) => (
+                <div
+                  key={ev.id}
+                  className="p-3 bg-surface/60 rounded-lg border border-surface-border flex items-start space-x-3 text-xs"
+                >
+                  <div className="w-2 h-2 rounded-full bg-forge-cyan mt-1.5 shrink-0"></div>
+                  <div className="flex-1 min-w-0 space-y-0.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <span className="font-mono font-semibold text-slate-200 break-all">{ev.type}</span>
+                      <span className="font-mono text-[10px] text-slate-500 shrink-0">
+                        {new Date(ev.timestamp).toLocaleTimeString()}
+                      </span>
+                    </div>
+                    <p className="text-slate-400 break-words">{ev.summary}</p>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+
+      {activeProject && <ManagerDecisionsPanel projectId={activeProject.id} />}
+
       {/* Configured Agents Section */}
       <div className="space-y-4">
         <div className="flex items-center justify-between">
@@ -318,74 +365,6 @@ export const DashboardView: React.FC = () => {
               />
             );
           })}
-        </div>
-      </div>
-
-      {/* Bottom Section: Manual Relay & Live Activity */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Manual Relay Panel (Left 1 col) */}
-        <div className="bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg space-y-4">
-          <h3 className="text-sm font-semibold text-white font-mono uppercase tracking-wider flex items-center space-x-2">
-            <span className="w-2 h-2 rounded-full bg-forge-emerald"></span>
-            <span>{t('dashboard.manualRelayTitle')}</span>
-          </h3>
-
-          <div className="p-4 bg-surface rounded-lg border border-surface-border space-y-2 text-xs">
-            <p className="text-slate-300">
-              {t('dashboard.manualRelayDesc')}
-            </p>
-            <button
-              type="button"
-              onClick={() => setActiveView('manual-bridge')}
-              className="w-full mt-2 py-2 bg-forge-cyan/20 hover:bg-forge-cyan/30 text-forge-cyan font-mono font-semibold rounded-md border border-forge-cyan/30 transition text-xs flex items-center justify-center space-x-2"
-            >
-              <span>{t('dashboard.openManualBridge')}</span>
-              <ArrowRight className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        </div>
-
-        {/* Live Activity Stream (Right 2 cols) */}
-        <div className="lg:col-span-2 bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-white font-mono uppercase tracking-wider flex items-center space-x-2">
-              <Clock className="w-4 h-4 text-forge-cyan" />
-              <span>{t('dashboard.liveStreamTitle')}</span>
-            </h3>
-            <button
-              type="button"
-              onClick={() => setActiveView('timeline')}
-              className="text-xs font-mono text-forge-cyan hover:underline"
-            >
-              {t('dashboard.fullTimeline')}
-            </button>
-          </div>
-
-          <div className="space-y-3 max-h-80 overflow-y-auto pr-1">
-            {events.length === 0 ? (
-              <div className="text-xs text-slate-500 font-mono py-6 text-center">
-                {t('dashboard.noEvents')}
-              </div>
-            ) : (
-              events.slice(0, 6).map((ev) => (
-                <div
-                  key={ev.id}
-                  className="p-3 bg-surface/60 rounded-lg border border-surface-border flex items-start space-x-3 text-xs"
-                >
-                  <div className="w-2 h-2 rounded-full bg-forge-cyan mt-1.5 shrink-0"></div>
-                  <div className="flex-1 space-y-0.5">
-                    <div className="flex items-center justify-between">
-                      <span className="font-mono font-semibold text-slate-200">{ev.type}</span>
-                      <span className="font-mono text-[10px] text-slate-500">
-                        {new Date(ev.timestamp).toLocaleTimeString()}
-                      </span>
-                    </div>
-                    <p className="text-slate-400">{ev.summary}</p>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
         </div>
       </div>
     </div>

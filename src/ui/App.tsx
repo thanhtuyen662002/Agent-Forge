@@ -11,7 +11,6 @@ import { TaskDetailView } from './views/TaskDetailView';
 import { AgentCenterView } from './views/AgentCenterView';
 import { CapacityView } from './views/CapacityView';
 import { TimelineView } from './views/TimelineView';
-import { DecisionsView } from './views/DecisionsView';
 import { EvidenceView } from './views/EvidenceView';
 import { ProjectsView } from './views/ProjectsView';
 import { SettingsView } from './views/SettingsView';
@@ -36,8 +35,6 @@ const MainLayout: React.FC = () => {
         return <CapacityView />;
       case 'timeline':
         return <TimelineView />;
-      case 'decisions':
-        return <DecisionsView />;
       case 'evidence':
         return <EvidenceView />;
       case 'projects':

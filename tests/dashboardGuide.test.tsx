@@ -180,7 +180,6 @@ describe.each(['en-US', 'vi-VN'] as SupportedLocale[])('dashboard guide through 
       expect(row.textContent).toContain(t('dashboardGuide.notDone'));
       expect(row.querySelector('button')?.type).toBe('button');
     }
-    expect(setup.textContent).not.toContain(t('dashboardGuide.setupComplete'));
     expect(section('dashboard-attention-title').textContent).toContain(t('dashboardGuide.noAttention'));
     expect(context.activeProject).toBeNull();
     expect(context.tasks).toEqual([]);
@@ -264,8 +263,9 @@ describe.each(['en-US', 'vi-VN'] as SupportedLocale[])('dashboard guide through 
 
     api.getProjects.mockResolvedValue([{ ...ready, status: 'RUNNING', started_at: now }]);
     await act(async () => { await context.refreshData(); });
-    expect(section('dashboard-setup-title').textContent).toBe(t('dashboardGuide.setupComplete'));
-    expect(section('dashboard-setup-title').querySelector('ul')).toBeNull();
+    // A finished setup guide leaves the dashboard instead of taking a row (#354).
+    expect(container.querySelector('section[aria-labelledby="dashboard-setup-title"]')).toBeNull();
+    expect(container.textContent).not.toContain(t('dashboardGuide.title'));
     expect(container.textContent).toContain(t('header.statusRunning'));
   });
 
