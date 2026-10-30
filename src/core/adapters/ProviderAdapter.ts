@@ -65,6 +65,17 @@ export interface AgentExecutionRequest {
    * never synchronized back.
    */
   expectedProtocol?: 'coder.v1' | 'review.v1' | 'manager.v1' | 'plan.v1';
+  /**
+   * Files the previous revision of this task wrote (#352). A coder.v1 run gets them
+   * laid over its isolated workspace; they pass the same scope, policy and size checks
+   * as provider output when the workspace is synchronized back.
+   */
+  carriedFiles?: CarriedFile[];
+}
+
+export interface CarriedFile {
+  relativePath: string;
+  content: Buffer;
 }
 
 export interface AgentExecutionResult {

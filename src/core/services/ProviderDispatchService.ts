@@ -10,6 +10,7 @@ import { ProtocolParser } from '../protocol/parser';
 import {
   AgentExecutionRequest,
   AgentExecutionResult,
+  CarriedFile,
   RuntimeExecutionBinding,
   ProviderAdapter,
 } from '../adapters/ProviderAdapter';
@@ -90,14 +91,20 @@ export class ProviderDispatchService {
   private readonly stopFence: ProjectStopFenceService;
   private readonly nonHandoffLifecycle: NonHandoffExecutionLifecycle;
   private readonly nonHandoffTimeoutMs: number;
+  private readonly carryForward?: (auth: ExecutionAuthorization, workingDirectory: string) => CarriedFile[];
 
   constructor(
     private providerRegistry: ProviderRegistry,
     private repo: Repository,
     private eventService?: EventService,
     private gitWorktreeService?: GitWorktreeService,
-    options: { nonHandoffTimeoutMs?: number } = {}
+    options: {
+      nonHandoffTimeoutMs?: number;
+      /** The previous revision's files a coder run of this authorization builds on (#352). */
+      carryForward?: (auth: ExecutionAuthorization, workingDirectory: string) => CarriedFile[];
+    } = {}
   ) {
+    this.carryForward = options.carryForward;
     this.observationService = new ProviderHealthObservationService(this.repo);
     // Keep this compatibility-shaped property for the focused failure test
     // seam while routing the actual write through the single health facade.
@@ -1377,6 +1384,15 @@ export class ProviderDispatchService {
       contextFiles: parsedContextFiles,
       runtimeBinding,
     };
+    const workingDirectory = runtimeBinding?.workspace?.workingDirectory;
+    if (this.carryForward && workingDirectory) {
+      try {
+        const carried = this.carryForward(auth, workingDirectory);
+        if (carried.length > 0) request.carriedFiles = carried;
+      } catch {
+        // Carrying the previous revision forward is best effort; the run starts from HEAD.
+      }
+    }
 
     // 14. Persist Dispatched Audit Event
     if (this.eventService) {
