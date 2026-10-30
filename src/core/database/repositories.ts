@@ -392,6 +392,22 @@ export class Repository {
       .run(projectId, `automation.task_dependencies:${taskId}`, JSON.stringify([...new Set(dependsOn)]));
   }
 
+  /** Every stored task dependency of a project, keyed by task ID (#366, the dependency graph). */
+  public getProjectTaskDependencies(projectId: string): Record<string, string[]> {
+    const rows = this.db
+      .prepare(`SELECT key, value_json FROM project_settings WHERE project_id = ? AND key LIKE 'automation.task_dependencies:%'`)
+      .all(projectId) as Array<{ key: string; value_json: unknown }>;
+    const result: Record<string, string[]> = {};
+    for (const row of rows) {
+      try {
+        const value = typeof row.value_json === 'string' ? JSON.parse(row.value_json) : [];
+        const ids = Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+        if (ids.length > 0) result[row.key.slice('automation.task_dependencies:'.length)] = ids;
+      } catch { /* A malformed entry shows no dependency. */ }
+    }
+    return result;
+  }
+
   /** Records the planning anchor once; an existing anchor is never replaced. */
   public setProjectPlanningTaskId(projectId: string, taskId: string): boolean {
     return this.db
