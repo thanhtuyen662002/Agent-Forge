@@ -1,4 +1,5 @@
 import React from 'react';
+import { BrandMark } from './BrandMark';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { ShieldAlert, Play, Pause, FolderGit2 } from 'lucide-react';
@@ -70,9 +71,7 @@ export const Header: React.FC = () => {
     <header className="h-14 bg-surface border-b border-surface-border px-4 flex items-center gap-4 shrink-0 z-30">
       {/* Brand */}
       <div className="flex items-center gap-2.5 shrink-0">
-        <div className="w-7 h-7 rounded-md bg-gradient-to-br from-forge-cyan to-forge-blue flex items-center justify-center">
-          <span className="font-mono font-bold text-white text-xs">AF</span>
-        </div>
+        <BrandMark className="w-7 h-7 shrink-0" />
         <span className="text-sm font-semibold text-white whitespace-nowrap">Agent Forge</span>
         {!isElectron && (
           <span className="text-[10px] px-1.5 py-0.5 rounded border border-surface-border text-slate-400 whitespace-nowrap">{t('actions.previewReadOnly')}</span>
