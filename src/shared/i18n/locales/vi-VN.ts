@@ -131,6 +131,15 @@ export const viVN: TranslationDictionary = {
     noEvents: 'Chưa có sự kiện nào được ghi nhận.',
   },
   taskBoard: {
+    graph: {
+      viewLabel: 'Cách xem nhiệm vụ',
+      boardView: 'Bảng',
+      graphView: 'Sơ đồ phụ thuộc',
+      hint: 'Các cột chạy từ trái sang phải: task cùng cột chạy song song được, đường nối dẫn từ một task tới các task cần nó. Rê chuột vào task để làm nổi các đường nối của nó.',
+      noDependencies: 'Dự án này chưa có dữ liệu phụ thuộc (lập kế hoạch trước khi có tính năng này), nên các task chạy lần lượt theo thứ tự kế hoạch.',
+      empty: 'Không có task nào để hiển thị.',
+      nodeLabelWithDeps: '{title}, phụ thuộc: {deps}',
+    },
     title: 'Bảng Kanban Nhiệm vụ',
     subtitle: 'Máy trạng thái vòng đời theo dõi nhiệm vụ từ khi tạo, phân rã, lập trình, kiểm thử đến hoàn thành.',
     newTask: 'Nhiệm vụ mới',

@@ -131,6 +131,15 @@ export const enUS: TranslationDictionary = {
     noEvents: 'No events recorded yet.',
   },
   taskBoard: {
+    graph: {
+      viewLabel: 'Task view',
+      boardView: 'Board',
+      graphView: 'Dependency graph',
+      hint: 'Columns run left to right: tasks in one column can run at the same time, and a line joins each task to the tasks that need it. Hover a task to highlight its links.',
+      noDependencies: 'This project has no task dependencies (planned before dependencies existed), so its tasks run one after another in plan order.',
+      empty: 'No tasks to show.',
+      nodeLabelWithDeps: '{title}, depends on: {deps}',
+    },
     title: 'Task Kanban Board',
     subtitle: 'Lifecycle state machine tracks tasks from creation through decomposition, coding, validation, and completion.',
     newTask: 'New task',

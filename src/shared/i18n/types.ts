@@ -134,6 +134,15 @@ export interface TranslationDictionary {
     noEvents: string;
   };
   taskBoard: {
+    graph: {
+      viewLabel: string;
+      boardView: string;
+      graphView: string;
+      hint: string;
+      noDependencies: string;
+      empty: string;
+      nodeLabelWithDeps: string;
+    };
     title: string;
     subtitle: string;
     newTask: string;

@@ -107,7 +107,7 @@ const isMcpCaller = (event: unknown): boolean => event === MCP_CALLER_EVENT;
 /** Channels an authenticated MCP caller may invoke; never credentials, sign-in, release or MCP settings. */
 export const MCP_INVOKABLE_CHANNELS: ReadonlySet<string> = new Set([
   'project:list', 'project:get', 'project:create', 'project:importContract', 'project:transition',
-  'task:list', 'task:get', 'task:create', 'task:retry', 'task:getContextPaths', 'task:setContextPaths', 'task:getDependencies', 'task:setDependencies', 'events:list', 'agents:roster',
+  'task:list', 'task:get', 'task:create', 'task:retry', 'task:getContextPaths', 'task:setContextPaths', 'task:getDependencies', 'task:setDependencies', 'task:listDependencies', 'events:list', 'agents:roster',
   'verification:getCommands', 'verification:saveCommands',
   'automation:status', 'automation:managerDecisions', 'automation:setManagerMode', 'automation:decideManagerProposal',
   'automation:getParallelTasks', 'automation:setParallelTasks', 'verification:getEnvironment', 'verification:setEnvironment',
@@ -471,6 +471,12 @@ export function registerIpcHandlers(
     if (!parsed.success) return { success: false, errorCode: 'INVALID_INPUT' };
     if (!contextTask(parsed.data.projectId, parsed.data.taskId)) return { success: false, errorCode: 'TASK_NOT_FOUND' };
     return { success: true, dependsOn: repo.getTaskDependencies(parsed.data.projectId, parsed.data.taskId) };
+  });
+
+  registerPrivilegedHandler('task:listDependencies', async (_, payload: unknown) => {
+    const projectId = readProjectId(payload);
+    if (!projectId || !repo.getProject(projectId)) return { success: false, errorCode: 'PROJECT_NOT_FOUND' };
+    return { success: true, dependencies: repo.getProjectTaskDependencies(projectId) };
   });
 
   registerPrivilegedHandler('task:setDependencies', async (_, payload: unknown) => {
