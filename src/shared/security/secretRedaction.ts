@@ -119,14 +119,19 @@ export function redactJsonLines(value: string): string | null {
     try { parsed = JSON.parse(line); } catch { return null; }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
     try {
-      safe.push(redactSensitiveText(line));
+      // A line replaced as a whole (a secret only an escaped view revealed, #347) is no
+      // longer JSON; it becomes the marker event like a rejected line.
+      const redacted = redactSensitiveText(line);
+      safe.push(redacted === REDACTED_SECRET ? REDACTED_JSON_LINE : redacted);
     } catch (error) {
       if (!(error instanceof OutputSanitizationError) || error.code !== 'OUTPUT_REDACTION_UNSAFE') throw error;
       safe.push(REDACTED_JSON_LINE);
     }
   }
   try {
-    return redactSensitiveText(safe.join('\n'));
+    const joined = safe.join('\n');
+    const redacted = redactSensitiveText(joined);
+    return redacted === REDACTED_SECRET && joined !== REDACTED_SECRET ? null : redacted;
   } catch {
     return null;
   }
