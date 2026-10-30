@@ -1,0 +1,26 @@
+import React, { useId } from 'react';
+
+/**
+ * The Agent Forge mark (#345): a white anvil with an amber spark on the cyan–blue–violet
+ * brand gradient. Same geometry as public/favicon.svg and build/icon.ico
+ * (scripts/generate-brand-icons.py).
+ */
+export const BrandMark: React.FC<{ className?: string; title?: string }> = ({ className, title = 'Agent Forge' }) => {
+  const gradientId = `af-bg-${useId().replace(/:/g, '')}`;
+  return (
+    <svg viewBox="0 0 512 512" className={className} role="img" aria-label={title}>
+      <defs>
+        <linearGradient id={gradientId} x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stopColor="#06b6d4" />
+          <stop offset="0.55" stopColor="#3b82f6" />
+          <stop offset="1" stopColor="#8b5cf6" />
+        </linearGradient>
+      </defs>
+      <rect width="512" height="512" rx="112" fill={`url(#${gradientId})`} />
+      <g transform="translate(0 16)">
+        <path fill="#ffffff" d="M84 232H404Q416 232 416 244V272Q416 284 404 284H334L314 330H340Q352 330 356 342L366 384Q368 396 356 396H156Q144 396 146 384L156 342Q160 330 172 330H198L178 284H150Q104 284 84 232Z" />
+        <path fill="#fcd34d" d="M300 82L314 124L356 138L314 152L300 194L286 152L244 138L286 124ZM374 72L380 90L398 96L380 102L374 120L368 102L350 96L368 90ZM226 86L230.5 99.5L244 104L230.5 108.5L226 122L221.5 108.5L208 104L221.5 99.5Z" />
+      </g>
+    </svg>
+  );
+};
