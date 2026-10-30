@@ -555,7 +555,11 @@ recorded as `AUTH_ERROR` and is skipped until it is signed in again.
   sets the project's `automation.parallel_tasks` (1–10, default 1). MCP sets it
   with `configure_automation` and `parallelTasks`.
   - **With 1,** tasks run one after another, and with automatic integration each
-    task sees the code of the tasks before it (#295).
+    task sees the code of the tasks before it (#295). Only the earliest
+    unfinished task runs (#340). While it waits for its review, a retry pause
+    or its account lease, no later task starts. If it needs the owner
+    (`NEEDS_HUMAN`, `BLOCKED`, `FAILED`), the status shows
+    `EARLIER_TASK_NEEDS_OWNER` until it is retried or done.
   - **With N > 1,** up to N coder runs of different tasks run at once next to the
     project's single lane (verification, review, integration, Manager). The
     Manager is then told to plan self-contained tasks.

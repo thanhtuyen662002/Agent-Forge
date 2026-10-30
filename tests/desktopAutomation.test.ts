@@ -291,6 +291,38 @@ describe('desktop automation runtime', () => {
     expect(adapterCalls).toBe(2); // A completed run is never repeated.
   }, 120_000);
 
+  it.runIf(process.platform === 'win32')('one task at a time on integrated code never skips ahead of an earlier unfinished task (#340)', async () => {
+    verify(addCodexCoder());
+    const first = await approvedTask();
+    const second = await approvedTask();
+    repo.setProjectAutoIntegrate(projectId, true); // With one task at a time: the sequential plan of #295.
+    let clock = Date.now();
+    service = new DesktopAutomationService(repo, events, registry, {
+      worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer, now: () => new Date(clock).toISOString() });
+    coderFailures = 1;
+    await service.tick(); await service.drain();
+    expect(adapterCalls).toBe(1);
+    // The first task waits out its retry pause; the second must not start on code without it.
+    await service.tick(); await service.drain();
+    expect(adapterCalls).toBe(1);
+    expect(repo.getExecutionAuthorizationsByTask(second.id)).toEqual([]);
+    expect(statusOf()).toMatchObject({ phase: 'FAILED', taskId: first.id });
+
+    // An earliest task that needs the owner holds the later ones, and the status says so.
+    db.prepare("UPDATE tasks SET state = 'NEEDS_HUMAN' WHERE id = ?").run(first.id);
+    clock += 120_000;
+    await service.tick(); await service.drain();
+    expect(adapterCalls).toBe(1);
+    expect(repo.getExecutionAuthorizationsByTask(second.id)).toEqual([]);
+    expect(statusOf()).toMatchObject({ phase: 'WAITING_FOR_MANAGER', taskId: first.id, reasonCode: 'EARLIER_TASK_NEEDS_OWNER' });
+
+    // Once it is finished, the next task runs.
+    db.prepare("UPDATE tasks SET state = 'DONE' WHERE id = ?").run(first.id);
+    await service.tick(); await service.drain();
+    expect(adapterCalls).toBe(2);
+    expect(repo.getExecutionAuthorizationsByTask(second.id)).toHaveLength(1);
+  }, 180_000);
+
   it.runIf(process.platform === 'win32')('retries a failed run on another coder account and shows truthful progress (#302)', async () => {
     const first = addCodexCoder('A coder');
     const second = addCodexCoder('B coder');
