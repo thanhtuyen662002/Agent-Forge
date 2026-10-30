@@ -265,6 +265,13 @@ export interface AuthorizedTaskTransitionBinding {
   readonly expectedOwnershipEpoch: number;
   readonly expectedPausedFromState: TaskPausedFromState | null;
   readonly expectedMaxRevisions: number;
+  /**
+   * The task's updated_at when the binding was captured (#368). It is part of the
+   * deterministic transition event ID, so a replay of the same captured request stays
+   * idempotent while the same transition taken again later (an owner clearing a task
+   * the Manager blocked twice in one revision) is a new transition, not a stale replay.
+   */
+  readonly expectedUpdatedAt?: string;
 }
 
 /**
