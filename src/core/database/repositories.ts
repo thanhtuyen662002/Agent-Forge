@@ -590,7 +590,7 @@ export class Repository {
 
   public getTasksByProject(projectId: string): Task[] {
     const rows = this.db
-      .prepare('SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC')
+      .prepare('SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC, rowid ASC')
       .all(projectId) as Record<string, unknown>[];
     return rows.map((r) => this.mapTask(r));
   }
