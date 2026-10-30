@@ -76,6 +76,7 @@ describe('CLI coder file creation and deletion within its authorized scope (#240
       const plant = /PLANT:(.+)/.exec(prompt);
       if (plant) fs.writeFileSync(plant[1].trim(), 'from the owner\\n');
       if (prompt.includes('CREATE_MANY')) for (let i = 0; i < 130; i++) write('src/many/f' + i + '.ts', 'x');
+      if (prompt.includes('FIX_CARRIED')) fs.appendFileSync(path.join(cwd, 'src', 'carried.ts'), 'export const fixed = true;\\n');
       process.stdout.write(JSON.stringify(${JSON.stringify(CODER_PAYLOAD)}) + '\\n');
     `, 'utf8');
 
@@ -103,8 +104,8 @@ describe('CLI coder file creation and deletion within its authorized scope (#240
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  const run = (ops: string[], contextFiles: string[] = ['src']) => adapter.execute({
-    taskId: 'TSK-FILES', projectId: 'PROJ-FILES', instructions: ops, contextFiles,
+  const run = (ops: string[], contextFiles: string[] = ['src'], carriedFiles?: AgentExecutionRequest['carriedFiles']) => adapter.execute({
+    taskId: 'TSK-FILES', projectId: 'PROJ-FILES', instructions: ops, contextFiles, carriedFiles,
     runtimeBinding: {
       authorizationId: 'auth-files', routingDecisionId: 'decision-files', assignmentId: 'assignment-files', providerId: 'fixture-file-ops',
       accountId: 'account-files', resourceId: 'resource-files', adapterType: 'LOCAL_CLI', modelName: 'fixture',
@@ -254,6 +255,37 @@ describe('CLI coder file creation and deletion within its authorized scope (#240
     expect(result.error ?? null).toBeNull();
     expect(result.status).toBe('COMPLETED');
     expect(fs.readFileSync(path.join(projectRoot, 'README.md'), 'utf8')).toBe('# Project\nMore docs\n');
+  });
+
+  it('builds on the previous revision: carried files are in the workspace and synchronized back (#352)', async () => {
+    const carried = [
+      { relativePath: 'src/carried.ts', content: Buffer.from('export const carried = 1;\n') },
+      { relativePath: 'src/existing.ts', content: Buffer.from('export const existing = 2;\n') },
+    ];
+    const prompt = vi.spyOn(adapter as unknown as { buildPrompt: (request: AgentExecutionRequest) => string }, 'buildPrompt');
+    const result = await run(['FIX_CARRIED'], ['src'], carried);
+
+    expect(result.error ?? null).toBeNull();
+    expect(result.status).toBe('COMPLETED');
+    expect(fs.readFileSync(src('carried.ts'), 'utf8')).toBe('export const carried = 1;\nexport const fixed = true;\n');
+    expect(fs.readFileSync(src('existing.ts'), 'utf8')).toBe('export const existing = 2;\n');
+    expect(prompt.mock.results[0].value).toContain('YOUR PREVIOUS REVISION OF THIS TASK');
+    expect(prompt.mock.results[0].value).toContain('- src/carried.ts');
+  });
+
+  it('skips carried files outside the authorized scope or denied by policy (#352)', async () => {
+    const result = await run(['EDIT_EXISTING'], ['src'], [
+      { relativePath: 'outside.txt', content: Buffer.from('not authorized\n') },
+      { relativePath: 'src/.env.production', content: Buffer.from('SECRET=1\n') },
+      { relativePath: '../escape.ts', content: Buffer.from('escape\n') },
+    ]);
+
+    expect(result.error ?? null).toBeNull();
+    expect(result.status).toBe('COMPLETED');
+    expect(fs.existsSync(path.join(projectRoot, 'outside.txt'))).toBe(false);
+    expect(fs.existsSync(src('.env.production'))).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, 'escape.ts'))).toBe(false);
+    expect(fs.readFileSync(src('existing.ts'), 'utf8')).toContain('edited');
   });
 
   it('keeps refusing new files when only individual files were authorized', async () => {
