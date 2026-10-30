@@ -9,6 +9,7 @@ import {
   QuotaSnapshotInfo,
   AgentExecutionRequest,
   AgentExecutionResult,
+  CarriedFile,
   RuntimeErrorCode,
 } from './ProviderAdapter';
 import { Capability, ProviderHealthStatus, ProviderAdapterType } from '../types/domain';
@@ -642,6 +643,7 @@ function localCliPrepareWorkspace(
   contextFiles: string[],
   executionId: string,
   ownershipDigest: string,
+  carried: ReadonlyArray<CarriedFile> = [],
 ): LocalCliWorkspaceLease {
   const absoluteSourceRoot = path.resolve(sourceRoot);
   const sourceStat = fs.lstatSync(absoluteSourceRoot);
@@ -686,8 +688,9 @@ function localCliPrepareWorkspace(
       localCliEnsureWorkspaceParent(path.dirname(target), workspaceRoot);
       localCliAtomicWrite(target, source.buffer, workspaceRoot, entry.sourceMode);
     }
-    return { executionId, ownerToken, ownershipDigest, sourceRoot: sourceRealRoot, workspaceRoot, workspaceIdentity, markerPath, entries,
-      ...localCliCreationScope(sourceRealRoot, contextFiles) };
+    const scope = localCliCreationScope(sourceRealRoot, contextFiles);
+    localCliOverlayCarriedFiles(carried, { entries, ...scope }, sourceRealRoot, workspaceRoot, copiedBytes);
+    return { executionId, ownerToken, ownershipDigest, sourceRoot: sourceRealRoot, workspaceRoot, workspaceIdentity, markerPath, entries, ...scope };
   } catch (error) {
     activeLocalCliWorkspaces.delete(executionId);
     let cleanupFailed = false;
@@ -736,6 +739,49 @@ function localCliPrepareWorkspace(
     }
     throw error instanceof LocalCliWorkspaceError ? error : new LocalCliWorkspaceError('WORKSPACE_PREPARE_FAILED', 'could not prepare isolated workspace');
   }
+}
+
+/** Only a coder run builds on its previous revision; review, manager and plan runs are read-only. */
+function localCliCarriedFor(request: AgentExecutionRequest): ReadonlyArray<CarriedFile> {
+  const coder = request.expectedProtocol === undefined || request.expectedProtocol === 'coder.v1';
+  return coder ? request.carriedFiles ?? [] : [];
+}
+
+/**
+ * Lays the previous revision's files over a prepared workspace (#352). A file is skipped,
+ * not fatal, unless it is an authorized entry or lies where the provider itself may create
+ * files, passes write policy, and fits the workspace bounds; synchronization re-checks
+ * every carried file exactly like provider output. Returns the paths laid over.
+ */
+function localCliOverlayCarriedFiles(
+  carried: ReadonlyArray<CarriedFile>,
+  scope: { entries: ReadonlyArray<LocalCliWorkspaceEntry>; scopeDirectories: ReadonlyArray<string>; scopeNewPaths: ReadonlyArray<string> },
+  sourceRoot: string,
+  workspaceRoot: string,
+  copiedBytes: number,
+): string[] {
+  const known = new Set(scope.entries.map((entry) => localCliFoldPath(entry.relativePath)));
+  const newPaths = new Set(scope.scopeNewPaths.map(localCliFoldPath));
+  const directories = scope.scopeDirectories.map((directory) => `${localCliFoldPath(directory)}/`);
+  const laid: string[] = [];
+  let bytes = copiedBytes;
+  for (const file of carried.slice(0, LOCAL_CLI_WORKSPACE_MAX_CREATED_FILES)) {
+    let relative: string;
+    try { relative = localCliCanonicalRelative(file.relativePath); } catch { continue; }
+    const folded = localCliFoldPath(relative);
+    if (!known.has(folded) && !newPaths.has(folded) && !directories.some((directory) => folded.startsWith(directory))) continue;
+    const target = path.resolve(sourceRoot, relative);
+    if (!localCliContained(target, sourceRoot, false)) continue;
+    try { localCliPolicyOrThrow(target, sourceRoot, relative, true); } catch { continue; }
+    if (file.content.byteLength > LOCAL_CLI_FILE_MAX_BYTES || bytes + file.content.byteLength > LOCAL_CLI_WORKSPACE_MAX_BYTES) continue;
+    const workspacePath = path.join(workspaceRoot, relative);
+    localCliEnsureWorkspaceParent(path.dirname(workspacePath), workspaceRoot);
+    const replaced = known.has(folded) ? localCliCaptureIdentity(workspacePath) : undefined;
+    localCliAtomicWrite(workspacePath, file.content, workspaceRoot, undefined, replaced);
+    bytes += file.content.byteLength;
+    laid.push(relative);
+  }
+  return laid;
 }
 
 /** Explicit context paths that are real directories inside the source root. */
@@ -1127,6 +1173,13 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
       lines.push(...request.contextFiles.map((f) => `- ${f}`));
     }
 
+    const carried = localCliCarriedFor(request);
+    if (carried.length > 0) {
+      lines.push('');
+      lines.push('YOUR PREVIOUS REVISION OF THIS TASK (already in your workspace; build on it instead of starting over):');
+      lines.push(...carried.map((file) => `- ${file.relativePath}`));
+    }
+
     lines.push('');
     lines.push('OUTPUT REQUIREMENT:');
     lines.push(request.expectedProtocol === 'review.v1'
@@ -1386,6 +1439,7 @@ export abstract class LocalCliAdapterBase implements ProviderAdapter {
           canonicalContextFiles,
           executionId,
           request.runtimeBinding?.workspace?.ownershipDigest ?? '',
+          localCliCarriedFor(request),
         );
       } catch (error) {
         const workspaceError = error instanceof LocalCliWorkspaceError ? error.message : 'WORKSPACE_PREPARE_FAILED: isolated provider workspace could not be prepared';

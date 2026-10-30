@@ -15,6 +15,7 @@ import { resolveTrustedExecutable } from './ExecutableResolver';
 import { GitService } from './GitService';
 import { OWNER_TASK_RETRIED_EVENT, TaskService } from './TaskService';
 import { widenTaskContext } from './TaskContextWidening';
+import { collectCarriedFiles } from './RevisionCarryForward';
 import { VerificationService } from './VerificationService';
 import { AutomatedVerificationService, VERIFICATION_FAILED_EVENT, VERIFICATION_PASSED_EVENT, VERIFICATION_SKIPPED_EVENT } from './AutomatedVerificationService';
 import { ProductReviewService, type ReviewerCandidate } from './ProductReviewService';
@@ -790,7 +791,9 @@ export class DesktopAutomationService {
       }
 
       // 6. Lease, managed worktree, scheduled dispatch and settlement.
-      const dispatch = new ProviderDispatchService(this.providerRegistry, this.repo, this.eventService, worktrees);
+      const dispatch = new ProviderDispatchService(this.providerRegistry, this.repo, this.eventService, worktrees, {
+        carryForward: (authorization, workingDirectory) => collectCarriedFiles(this.repo, authorization, workingDirectory, managedRoot),
+      });
       const scheduler = new ConcurrentExecutionScheduler(this.repo, new WorkerSlotLeaseService(this.repo), worktrees, dispatch);
       const result = await scheduler.execute(auth.id);
       if (result.status !== 'COMPLETED') {
