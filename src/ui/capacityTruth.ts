@@ -64,7 +64,8 @@ export function deriveConnectivityState(input: {
 }): ConnectivityState {
   if (!input.isElectron) return 'BROWSER_PREVIEW';
   if (input.refreshError) return 'ERROR';
-  if (input.loading || input.hasRefreshed !== true) return 'CONNECTING';
+  // Only the first refresh is "connecting"; later polls keep the state and show a ripple (#358).
+  if (input.hasRefreshed !== true) return 'CONNECTING';
   return 'ONLINE';
 }
 

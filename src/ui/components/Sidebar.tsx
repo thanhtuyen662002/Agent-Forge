@@ -21,6 +21,12 @@ export const Sidebar: React.FC = () => {
   const { activeView, setActiveView, tasks, densityMode, setDensityMode, isElectron, loading, refreshError, hasRefreshed } = useOrchestrator();
   const { t, locale, setLocale } = useI18n();
   const connectivity = deriveConnectivityState({ isElectron, loading, refreshError, hasRefreshed });
+  const connectivityLabel = t(`sidebar.${connectivity === 'ONLINE' ? 'online' : connectivity === 'CONNECTING' ? 'connecting' : connectivity === 'ERROR' ? 'error' : 'browserPreview'}`);
+  // Counts refreshes; a new key restarts the one-shot ripple animation.
+  const [refreshPulse, setRefreshPulse] = React.useState(0);
+  React.useEffect(() => {
+    if (loading) setRefreshPulse((value) => value + 1);
+  }, [loading]);
 
   const pendingBridgeTasks = tasks.filter(
     (t) => t.state === 'CODING' || t.state === 'REVIEW_READY' || t.state === 'PLANNED'
@@ -122,21 +128,14 @@ export const Sidebar: React.FC = () => {
             <Languages className="w-3.5 h-3.5 text-forge-cyan" aria-hidden="true" />
             <span className="font-medium">{locale === 'vi-VN' ? 'Tiếng Việt' : 'English'}</span>
           </button>
-          <span
-            className={`flex items-center gap-1.5 ${
-              connectivity === 'ONLINE'
-                ? 'text-emerald-400'
-                : connectivity === 'CONNECTING'
-                ? 'text-amber-400'
-                : connectivity === 'ERROR'
-                ? 'text-rose-400'
-                : 'text-slate-400'
-            }`}
-            role="status"
-            aria-live="polite"
-          >
+          {/* A dot instead of words (#358); each data refresh sends one ripple out of it. */}
+          <span role="status" aria-live="polite" title={connectivityLabel} className="relative mr-1 flex items-center justify-center w-4 h-4">
+            {refreshPulse > 0 && connectivity === 'ONLINE' && (
+              <span key={refreshPulse} aria-hidden="true" className="af-ripple absolute inset-0.5 rounded-full bg-emerald-400" />
+            )}
             <span
-              className={`w-1.5 h-1.5 rounded-full ${
+              aria-hidden="true"
+              className={`relative w-2.5 h-2.5 rounded-full ${
                 connectivity === 'ONLINE'
                   ? 'bg-emerald-400'
                   : connectivity === 'CONNECTING'
@@ -146,7 +145,7 @@ export const Sidebar: React.FC = () => {
                   : 'bg-slate-400'
               }`}
             ></span>
-            <span>{t(`sidebar.${connectivity === 'ONLINE' ? 'online' : connectivity === 'CONNECTING' ? 'connecting' : connectivity === 'ERROR' ? 'error' : 'browserPreview'}`)}</span>
+            <span className="sr-only">{connectivityLabel}</span>
           </span>
         </div>
       </div>

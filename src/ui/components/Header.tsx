@@ -69,7 +69,7 @@ export const Header: React.FC = () => {
   const primaryButton = 'h-8 px-3 text-xs font-semibold rounded-md flex items-center gap-1.5 transition whitespace-nowrap disabled:opacity-50';
 
   return (
-    <header className="h-14 bg-surface border-b border-surface-border px-4 flex items-center gap-4 shrink-0 z-30">
+    <header className="app-titlebar h-14 bg-surface border-b border-surface-border px-4 flex items-center gap-4 shrink-0 z-30">
       {/* Brand: as wide as the sidebar, so its divider continues the sidebar's border. */}
       <div className="w-60 self-stretch flex items-center gap-2.5 shrink-0 border-r border-surface-border">
         <BrandMark className="w-7 h-7 shrink-0" />

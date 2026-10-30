@@ -41,6 +41,13 @@ function createWindow(
     minHeight: 700,
     backgroundColor: '#090d16',
     title: 'Agent-Forge — Local AI Engineering Control Plane',
+    // The app header is the title bar (#358): no native frame or menu bar. On Windows and
+    // Linux the system draws its minimize/maximize/close buttons over the header's right end.
+    ...(process.platform === 'darwin' ? {} : {
+      titleBarStyle: 'hidden' as const,
+      titleBarOverlay: { color: '#111726', symbolColor: '#cbd5e1', height: 56 },
+    }),
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,

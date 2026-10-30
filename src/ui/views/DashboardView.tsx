@@ -282,11 +282,12 @@ export const DashboardView: React.FC = () => {
         )}
       </section>
 
-      {/* Reviewed work beside the live activity, so neither pushes the rest off screen. */}
-      <div className="grid grid-cols-1 xl:grid-cols-5 gap-6 items-start">
+      {/* Reviewed work beside the live activity; both cards share the row height and the
+          activity list scrolls inside it (#358). */}
+      <div className="grid grid-cols-1 xl:grid-cols-5 gap-6 items-stretch">
         {activeProject && <div className="xl:col-span-3 min-w-0"><ReviewedWorkPanel projectId={activeProject.id} /></div>}
         {/* Live activity */}
-        <div className={`${activeProject ? 'xl:col-span-2' : 'xl:col-span-5'} min-w-0 bg-surface-card border border-surface-border rounded-xl p-6 shadow-lg space-y-4`}>
+        <div className={`${activeProject ? 'xl:col-span-2' : 'xl:col-span-5'} min-w-0 bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl flex flex-col gap-4`}>
           <div className="flex items-center justify-between gap-3">
             <h3 className="text-sm font-semibold text-white font-mono uppercase tracking-wider flex items-center space-x-2">
               <Clock className="w-4 h-4 text-forge-cyan" />
@@ -301,30 +302,32 @@ export const DashboardView: React.FC = () => {
             </button>
           </div>
 
-          <div className="space-y-3 max-h-80 overflow-y-auto pr-1">
-            {events.length === 0 ? (
-              <div className="text-xs text-slate-500 font-mono py-6 text-center">
-                {t('dashboard.noEvents')}
-              </div>
-            ) : (
-              events.slice(0, 6).map((ev) => (
-                <div
-                  key={ev.id}
-                  className="p-3 bg-surface/60 rounded-lg border border-surface-border flex items-start space-x-3 text-xs"
-                >
-                  <div className="w-2 h-2 rounded-full bg-forge-cyan mt-1.5 shrink-0"></div>
-                  <div className="flex-1 min-w-0 space-y-0.5">
-                    <div className="flex items-start justify-between gap-2">
-                      <span className="font-mono font-semibold text-slate-200 break-all">{ev.type}</span>
-                      <span className="font-mono text-[10px] text-slate-500 shrink-0">
-                        {new Date(ev.timestamp).toLocaleTimeString()}
-                      </span>
-                    </div>
-                    <p className="text-slate-400 break-words">{ev.summary}</p>
-                  </div>
+          <div className="relative xl:flex-1 xl:min-h-[14rem]">
+            <div className="space-y-3 max-h-80 overflow-y-auto pr-1 xl:max-h-none xl:absolute xl:inset-0">
+              {events.length === 0 ? (
+                <div className="text-xs text-slate-500 font-mono py-6 text-center">
+                  {t('dashboard.noEvents')}
                 </div>
-              ))
-            )}
+              ) : (
+                events.slice(0, 6).map((ev) => (
+                  <div
+                    key={ev.id}
+                    className="p-3 bg-surface/60 rounded-lg border border-surface-border flex items-start space-x-3 text-xs"
+                  >
+                    <div className="w-2 h-2 rounded-full bg-forge-cyan mt-1.5 shrink-0"></div>
+                    <div className="flex-1 min-w-0 space-y-0.5">
+                      <div className="flex items-start justify-between gap-2">
+                        <span className="font-mono font-semibold text-slate-200 break-all">{ev.type}</span>
+                        <span className="font-mono text-[10px] text-slate-500 shrink-0">
+                          {new Date(ev.timestamp).toLocaleTimeString()}
+                        </span>
+                      </div>
+                      <p className="text-slate-400 break-words">{ev.summary}</p>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
           </div>
         </div>
       </div>
