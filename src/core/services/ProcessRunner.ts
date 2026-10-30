@@ -8,7 +8,7 @@ import { ArtifactStore } from './ArtifactStore';
 import { isIssuedVerificationProcessBoundary, VerificationInvocationLease, VerificationProcessBoundary } from '../types/verificationCapability';
 import { RepositoryRootError, RepositoryRootErrorCode, RepositoryRootIdentity } from './RepositoryRootIdentity';
 import { RepositoryRootLease } from './RepositoryRootLease';
-import { OutputSanitizationError, type OutputSanitizationErrorCode, redactJsonLines, redactSensitiveText } from '../../shared/security/secretRedaction';
+import { OutputSanitizationError, type OutputSanitizationErrorCode, REDACTED_SECRET, redactJsonLines, redactSensitiveText } from '../../shared/security/secretRedaction';
 import {
   buildTrustedEnvironment,
   isProtectedExecutableName,
@@ -406,7 +406,11 @@ export class ProcessRunner {
    */
   public static scrubStdout(text: string): string {
     try {
-      return redactSensitiveText(text);
+      const redacted = redactSensitiveText(text);
+      // The whole text replaced because an escaped view revealed a secret (#347, VidFlow
+      // M5.2: a coder writing secret-redaction tests): a JSONL stream keeps its other events.
+      if (redacted === REDACTED_SECRET && text.trim() !== REDACTED_SECRET) return redactJsonLines(text) ?? redacted;
+      return redacted;
     } catch (error) {
       if (!(error instanceof OutputSanitizationError) || error.code !== 'OUTPUT_REDACTION_UNSAFE') throw error;
       const lines = redactJsonLines(text);

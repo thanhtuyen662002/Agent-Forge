@@ -73,6 +73,16 @@ describe('bounded shared output sanitizer', () => {
     expect(() => redactSensitiveText(text)).toThrow('OUTPUT_REDACTION_UNSAFE: Durable output could not be sanitized safely.');
   });
 
+  it('keeps a JSONL stream whose one event reveals a secret only in an escaped view (#347)', () => {
+    const hidden = JSON.stringify({ type: 'item.completed', item: { aggregated_output: 'const fixture = "pass\\u0077ord=' + opaque + '";' } });
+    const report = JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'coder report' } });
+    const text = [hidden, report].join('\n');
+    expect(redactSensitiveText(text)).toBe(REDACTED_SECRET); // The whole text, before #347.
+    const safe = redactJsonLines(text)!;
+    expect(safe.split('\n')).toEqual([REDACTED_JSON_LINE, report]);
+    expect(safe.includes(opaque)).toBe(false);
+  });
+
   it('drops only the unsafe events of a JSONL stream and keeps the rest (#326)', () => {
     const unsafe = JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', aggregated_output: 'export const auth = {\n  first: "' + opaque + '",\n  second: "x"\n};' } });
     const report = JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: '{"protocol":"coder.v1","status":"COMPLETED"}' } });

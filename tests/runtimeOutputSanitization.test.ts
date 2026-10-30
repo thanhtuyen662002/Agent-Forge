@@ -124,6 +124,18 @@ describe('real process output and durable observation sanitization', () => {
     }
   });
 
+  it('keeps the coder report of a JSONL stream whose one event hides a secret behind escapes (#347)', async () => {
+    const hidden = JSON.stringify({ type: 'item.completed', item: { aggregated_output: 'const fixture = "pass\\u0077ord=' + secret + '";' } });
+    const report = JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'coder report' } });
+    const result = await ProcessRunner.execute({ executable: process.execPath, args: [script(hidden + '\n' + report + '\n')],
+      cwd: root, repo, artifactStore: artifacts, projectId: 'runtime-output-project' });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.includes(secret)).toBe(false);
+    expect(result.stdout).toContain('agent_forge.redacted');
+    expect(result.stdout).toContain(report);
+    assertEvidence(result.stdoutEvidenceId, result.stdout);
+  });
+
   it('completes a JSONL stream whose unsafe event is dropped alone (#326)', async () => {
     const unsafe = JSON.stringify({ type: 'item.completed', item: { aggregated_output: 'api_key:{first:"' + secret + '",second:"x"}' } });
     const report = JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'coder report' } });
