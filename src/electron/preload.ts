@@ -34,6 +34,7 @@ export interface OrchestratorApi {
   getTask: (taskId: string) => Promise<any>;
   getTaskContextPaths: (projectId: string, taskId: string) => Promise<any>;
   setTaskContextPaths: (projectId: string, taskId: string, paths: string[]) => Promise<any>;
+  getTaskDependencies: (projectId: string, taskId: string) => Promise<any>;
   createTask: (data: {
     projectId: string;
     id?: string;
@@ -202,6 +203,7 @@ const api: OrchestratorApi = {
   getTask: (taskId: string) => ipcRenderer.invoke('task:get', { taskId }),
   getTaskContextPaths: (projectId: string, taskId: string) => ipcRenderer.invoke('task:getContextPaths', { projectId, taskId }),
   setTaskContextPaths: (projectId: string, taskId: string, paths: string[]) => ipcRenderer.invoke('task:setContextPaths', { projectId, taskId, paths }),
+  getTaskDependencies: (projectId: string, taskId: string) => ipcRenderer.invoke('task:getDependencies', { projectId, taskId }),
   createTask: (data) => ipcRenderer.invoke('task:create', data),
   retryTask: (projectId: string, taskId: string, note?: string) => ipcRenderer.invoke('task:retry', { projectId, taskId, ...(note ? { note } : {}) }),
   startReview: (taskId: string, binding?: TaskMutationBindingInput) =>

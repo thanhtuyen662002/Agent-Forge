@@ -382,6 +382,22 @@ describe('desktop automation runtime', () => {
       expect(await runParallel(3, 2)).toBe(2);
       expect(maxActiveCoders).toBe(2);
     }, 180_000);
+
+    it('runs only tasks whose dependencies are done, and the dependent one after them (#362)', async () => {
+      verify(addCodexCoder('Codex coder', 3));
+      const first = await approvedTask();
+      const second = await approvedTask();
+      const third = await approvedTask();
+      repo.setTaskDependencies(projectId, third.id, [first.id, second.id]);
+      repo.setProjectParallelTasks(projectId, 3);
+      service = new DesktopAutomationService(repo, events, registry, { worktreeRoot: path.join(tempDir, 'worktrees'), timer: fakeTimer, maxConcurrentExecutions: 10 });
+      await service.tick(); await service.drain();
+      expect(adapterCalls).toBe(2);
+      expect(repo.getExecutionAuthorizationsByTask(third.id)).toEqual([]);
+      db.prepare("UPDATE tasks SET state = 'DONE' WHERE id IN (?, ?)").run(first.id, second.id);
+      await service.tick(); await service.drain();
+      expect(repo.getExecutionAuthorizationsByTask(third.id)).toHaveLength(1);
+    }, 180_000);
   });
 
   it.runIf(process.platform === 'win32')('stops retrying a revision after three failed runs (#295)', async () => {
@@ -1711,14 +1727,65 @@ describe('desktop automation runtime', () => {
       expect(instructions).not.toContain('Tasks run in parallel');
     });
 
-    it('tells the Manager to plan self-contained tasks when several run at once (#306)', async () => {
+    it('tells the Manager that dependencies order tasks when several run at once on integrated code (#362)', async () => {
       addManager();
       repo.setProjectAutoIntegrate(projectId, true);
       repo.setProjectParallelTasks(projectId, 3);
       managerReply = planReply();
       service = planningService();
       await pass();
+      const instructions = managerRequests[0].instructions.join(' ');
+      expect(instructions).toContain('A task starts only after every task in its "depends_on" is reviewed and integrated');
+      expect(instructions).not.toContain('Tasks run in parallel');
+    });
+
+    it('tells the Manager to plan self-contained tasks when several run at once without integration (#306)', async () => {
+      addManager();
+      repo.setProjectParallelTasks(projectId, 3);
+      managerReply = planReply();
+      service = planningService();
+      await pass();
       expect(managerRequests[0].instructions.join(' ')).toContain('Tasks run in parallel');
+    });
+
+    it('stores planned dependencies and asks the Manager only for tasks whose dependencies are done (#362)', async () => {
+      addManager();
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      repo.setProjectParallelTasks(projectId, 3);
+      managerReply = planReply({ tasks: [
+        { title: 'Add the greeting', acceptance_criteria: ['Greeting shown'] },
+        { title: 'Add the farewell', acceptance_criteria: ['Farewell shown'] },
+        { title: 'Test both', acceptance_criteria: ['Tests cover both'], depends_on: [1, 2] },
+      ] });
+      service = planningService();
+      await pass();
+      const [greeting, farewell, both] = realTasks();
+      expect(repo.getTaskDependencies(projectId, both.id)).toEqual([greeting.id, farewell.id]);
+      expect(repo.getTaskDependencies(projectId, greeting.id)).toEqual([]);
+
+      for (let i = 0; i < 4; i += 1) await pass();
+      const decided = new Set(managerRequests.filter((request) => request.expectedProtocol === 'manager.v1').map((request) => request.taskId));
+      expect(decided.has(greeting.id) && decided.has(farewell.id)).toBe(true);
+      expect(decided.has(both.id)).toBe(false);
+      expect(repo.getTask(both.id)!.state).toBe('PLANNED');
+
+      db.prepare("UPDATE tasks SET state = 'DONE' WHERE id IN (?, ?)").run(greeting.id, farewell.id);
+      await pass();
+      expect(managerRequests.some((request) => request.expectedProtocol === 'manager.v1' && request.taskId === both.id)).toBe(true);
+    });
+
+    it('refuses a plan whose dependency names a later task, and creates nothing (#362)', async () => {
+      addManager();
+      repo.setProjectManagerMode(projectId, 'AUTO');
+      managerReply = planReply({ tasks: [
+        { title: 'Add the greeting', acceptance_criteria: ['Greeting shown'], depends_on: [2] },
+        { title: 'Test the greeting', acceptance_criteria: ['A test covers it'] },
+      ] });
+      service = planningService();
+      await pass();
+      expect(realTasks()).toEqual([]);
+      expect(repo.getEventsByProject(projectId).some((event) => event.type === 'AUTOMATION_MANAGER_FAILED' &&
+        (event.structured_payload as { reasonCode?: unknown } | null)?.reasonCode === 'PLAN_DEPENDENCY_INVALID')).toBe(true);
     });
 
     it('proposes the plan in approve mode and creates nothing until the owner approves', async () => {
@@ -1730,7 +1797,7 @@ describe('desktop automation runtime', () => {
       expect(realTasks()).toEqual([]);
       const [proposal] = service.getManager()!.listProposals(projectId);
       expect(proposal).toMatchObject({ decision: 'PLAN', instructions: ['Add the greeting', 'Test the greeting'] });
-      expect(proposal.plannedTasks[0]).toEqual({ title: 'Add the greeting', description: 'Show a greeting', acceptanceCriteria: ['Greeting shown'], priority: 'HIGH', risk: 'LOW', contextPaths: [] });
+      expect(proposal.plannedTasks[0]).toEqual({ title: 'Add the greeting', description: 'Show a greeting', acceptanceCriteria: ['Greeting shown'], priority: 'HIGH', risk: 'LOW', contextPaths: [], dependsOn: [] });
       expect(statusOf()).toMatchObject({ phase: 'WAITING_FOR_MANAGER', reasonCode: 'MANAGER_PROPOSAL_PENDING' });
       expect(await service.getManager()!.decideProposal(projectId, proposal.eventId, true)).toEqual({ success: true });
       expect(realTasks()).toHaveLength(2);

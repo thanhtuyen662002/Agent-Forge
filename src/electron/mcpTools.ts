@@ -330,6 +330,34 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
     },
   },
   {
+    name: 'get_task_dependencies',
+    description: 'The task IDs of the same project whose code a task needs; it starts only after they are done (and integrated when automatic integration is on).',
+    inputSchema: {
+      type: 'object',
+      properties: { projectId: str('Project ID.'), taskId: str('Task ID.') },
+      required: ['projectId', 'taskId'],
+      additionalProperties: false,
+    },
+    async run(args, registry) {
+      return expectSuccess(await registry.invoke('task:getDependencies', { projectId: text(args, 'projectId'), taskId: text(args, 'taskId') }));
+    },
+  },
+  {
+    name: 'set_task_dependencies',
+    description: 'Set the task IDs of the same project whose code a task needs (#362), so independent tasks can run in parallel. The whole list is replaced; a cycle is refused.',
+    inputSchema: {
+      type: 'object',
+      properties: { projectId: str('Project ID.'), taskId: str('Task ID.'), dependsOn: strings('Task IDs of the same project.') },
+      required: ['projectId', 'taskId', 'dependsOn'],
+      additionalProperties: false,
+    },
+    async run(args, registry) {
+      return expectSuccess(await registry.invoke('task:setDependencies', {
+        projectId: text(args, 'projectId'), taskId: text(args, 'taskId'), dependsOn: list(args, 'dependsOn') ?? [],
+      }));
+    },
+  },
+  {
     name: 'decide_manager_proposal',
     description: 'Approve or reject a Manager proposal waiting in APPROVE mode (eventId from get_project → manager.proposals).',
     inputSchema: {

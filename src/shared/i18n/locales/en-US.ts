@@ -174,6 +174,8 @@ export const enUS: TranslationDictionary = {
   taskDetail: {
     retryNoteLabel: 'Note to the Manager (optional)',
     retryNotePlaceholder: 'What you changed or decided, e.g. "package.json now has the build scripts"',
+    dependenciesTitle: 'Depends on',
+    dependenciesNone: 'No other task; it can run alongside others.',
     backToBoard: 'Back to Kanban Board',
     openInBridge: 'Open in Manual Bridge',
     stateLabel: 'State',
@@ -539,6 +541,7 @@ export const enUS: TranslationDictionary = {
       REVIEW_FAILED: 'The automated review did not finish, so no verdict was applied. Review the task yourself.',
       REVIEW_STALE: 'The changes moved after testing, so the review was not applied.',
       REVIEW_INTERRUPTED: 'The automated review was interrupted (for example by a restart); no verdict was applied.',
+      WAITING_FOR_DEPENDENCIES: 'The remaining tasks wait for the tasks they depend on to finish and be integrated.',
       NO_MANAGER: 'Add a Manager agent (Codex CLI, its own account) in Agent Center so tasks start automatically, or approve tasks yourself.',
       MANAGER_NOT_AVAILABLE: 'No Manager agent is usable right now (signed out, busy, or its CLI cannot manage).',
       MANAGER_PROPOSAL_PENDING: 'The Manager proposed the next step. Approve or reject it in Manager decisions.',

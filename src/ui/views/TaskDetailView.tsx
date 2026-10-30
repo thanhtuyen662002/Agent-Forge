@@ -3,6 +3,7 @@ import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { ProgressIndicator } from '../components/ProgressIndicator';
 import { TaskContextEditor } from '../components/TaskContextEditor';
+import { TaskDependenciesNote } from '../components/TaskDependenciesNote';
 import { useAutomationStatus } from '../runtimeStatus';
 import { UiActionResult, UiVerificationObservation, normalizeObservationResult, isVerificationObservation, uiActionFailure, uiActionFailureKey } from '../actionState';
 import {
@@ -231,6 +232,7 @@ export const TaskDetailView: React.FC = () => {
               </div>
             </div>
 
+            {isElectron && validTask && <TaskDependenciesNote projectId={task.project_id} taskId={task.id} />}
             {isElectron && validTask && <TaskContextEditor projectId={task.project_id} taskId={task.id} />}
           </div>
 

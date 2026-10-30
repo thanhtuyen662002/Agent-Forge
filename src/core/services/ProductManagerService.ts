@@ -12,6 +12,7 @@ import type { AgentExecutionResult, RuntimeExecutionBinding } from '../adapters/
 import type { AccountLease, Project, Task } from '../types/domain';
 import { MAX_PLAN_TASKS, type ManagerProtocol, type PlanProtocol } from '../types/protocols';
 import { contractSha256, parsePlanProtocol, validateContextPaths } from '../protocol/planProtocol';
+import { invalidPlanDependency, unmetDependencies } from './TaskDependencies';
 
 /** Marks Manager attempts so restart recovery only touches automated Manager calls. */
 export const MANAGER_ATTEMPT_MARKER = 'desktop-manager';
@@ -226,6 +227,8 @@ export class ProductManagerService {
     for (const task of candidates) {
       const kind = this.needsDecision(task);
       if (!kind || this.isSettled(task)) continue;
+      // A task is decided once the tasks it builds on are finished (#362), so its instructions see their code.
+      if (unmetDependencies(this.repo, task).length > 0) continue;
       if ((this.retryAfter.get(this.key(task)) ?? 0) > this.now().getTime()) {
         deferred ??= { task, kind, deferred: true };
         continue;
@@ -259,7 +262,7 @@ export class ProductManagerService {
 
   /** Open (undecided) proposals of a project, newest first, for the owner. */
   public listProposals(projectId: string): Array<{ eventId: string; taskId: string; taskTitle: string; taskRevision: number; decision: string; instructions: string[];
-    plannedTasks: Array<{ title: string; description: string; acceptanceCriteria: string[]; priority: string; risk: string; contextPaths: string[] }>; createdAt: string }> {
+    plannedTasks: Array<{ title: string; description: string; acceptanceCriteria: string[]; priority: string; risk: string; contextPaths: string[]; dependsOn: number[] }>; createdAt: string }> {
     const result = [];
     for (const task of this.repo.getTasksByProject(projectId)) {
       const proposal = this.openProposal(task);
@@ -270,7 +273,8 @@ export class ProductManagerService {
         instructions: payload.plan ? payload.plan.tasks.map((planned) => planned.title) : payload.decision?.instructions ?? [],
         // The owner sees exactly what would be created, not only titles.
         plannedTasks: payload.plan?.tasks.map((planned) => ({ title: planned.title, description: planned.description ?? '',
-          acceptanceCriteria: planned.acceptance_criteria, priority: planned.priority, risk: planned.risk, contextPaths: planned.context_paths ?? [] })) ?? [],
+          acceptanceCriteria: planned.acceptance_criteria, priority: planned.priority, risk: planned.risk, contextPaths: planned.context_paths ?? [],
+          dependsOn: planned.depends_on ?? [] })) ?? [],
         createdAt: proposal.timestamp });
     }
     return result.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -506,6 +510,9 @@ export class ProductManagerService {
           const check = validateContextPaths(project!.repository_path, planned.context_paths, { allowMissing: true });
           if (!check.ok) { finish('FAILED'); return failed('PLAN_CONTEXT_PATH_INVALID', true, { attemptId, contextReason: check.reasonCode, path: check.path }); }
         }
+        // Dependencies may only name earlier tasks of the plan (#362), which also rules out cycles.
+        const badDependency = invalidPlanDependency(plan.tasks);
+        if (badDependency !== null) { finish('FAILED'); return failed('PLAN_DEPENDENCY_INVALID', true, { attemptId, task: badDependency }); }
         proposalPayload = { plan, contractSha256: contractHash };
         apply = () => this.applyPlan(task.id, plan, contractHash!, snapshot);
         label = `a plan of ${plan.tasks.length} task(s)`;
@@ -596,7 +603,9 @@ export class ProductManagerService {
     if (this.repo.getTasksByProject(project.id).some((task) => task.id !== anchorId && !this.repo.isTaskTrashed(task.id))) {
       throw new ManagerApplyError('PLAN_TASKS_ALREADY_EXIST', false);
     }
+    if (invalidPlanDependency(plan.tasks) !== null) throw new ManagerApplyError('PLAN_DEPENDENCY_INVALID', false);
     this.repo.runInImmediateTransaction(() => {
+      const createdIds: string[] = [];
       for (const planned of plan.tasks) {
         // Re-checked at apply time: the repository may have changed since the proposal.
         const context = validateContextPaths(project.repository_path, planned.context_paths ?? [], { allowMissing: true });
@@ -606,6 +615,10 @@ export class ProductManagerService {
           acceptanceCriteria: planned.acceptance_criteria, constraints: planned.constraints,
         });
         if (context.paths.length > 0) this.repo.setTaskContextPaths(project.id, created.id, context.paths);
+        createdIds.push(created.id);
+        // Plan numbers are 1-based positions of earlier tasks (#362).
+        const dependsOn = (planned.depends_on ?? []).map((number) => createdIds[number - 1]).filter(Boolean);
+        if (dependsOn.length > 0) this.repo.setTaskDependencies(project.id, created.id, dependsOn);
       }
       if (!this.transition(anchorId, 'APPROVE')) throw new ManagerApplyError('TASK_TRANSITION_REJECTED', false);
       // The planning record leaves the active task list; its plan stays in the events.
@@ -641,7 +654,11 @@ export class ProductManagerService {
       ...(this.repo.getProjectAutoIntegrate(project.id) && this.repo.getProjectParallelTasks(project.id) === 1
         // Found in the MCP trial: a README task could not see the module the task before it created.
         ? ['Tasks run one at a time in the listed order, and each starts from the integrated code of the tasks before it. Put a change and its tests in the same task. When a task relies on files an earlier task creates, list those files in its context_paths too.']
-        : ['Tasks run in parallel from the same base commit and cannot see the changes of other tasks. Make every task self-contained: put a change and its tests in the same task, and prefer fewer, larger tasks over a chain of dependent ones.']),
+        : this.repo.getProjectAutoIntegrate(project.id)
+          // Several tasks at a time with automatic integration (#362): dependencies decide the order.
+          ? ['Up to several tasks run at the same time. A task starts only after every task in its "depends_on" is reviewed and integrated, from the integrated code; a task with no dependencies may start at once. Put a change and its tests in the same task. When a task relies on files an earlier task creates, list those files in its context_paths too.']
+          : ['Tasks run in parallel from the same base commit and cannot see the changes of other tasks. Make every task self-contained: put a change and its tests in the same task, and prefer fewer, larger tasks over a chain of dependent ones.']),
+      'For each task, list in "depends_on" the 1-based numbers of the earlier tasks in your list whose code it needs (for example [1, 3]); leave it empty for a task that needs none. Only list real needs: every extra dependency makes the project slower.',
       'Agent Forge runs the project test command itself after each coder run; do not create a task that only runs tests.',
       'For each task, list in "context_paths" (at most 32, relative paths) every existing file or directory the coder must read or change, and every new file or directory the task will create: the coder can change only listed files and create files only inside listed directories or at listed new paths.',
       `Use exactly: project_id "${project.id}", contract_sha256 "${contractHash}".`,

@@ -15,6 +15,7 @@ import { resolveTrustedExecutable } from './ExecutableResolver';
 import { GitService } from './GitService';
 import { OWNER_TASK_RETRIED_EVENT, TaskService } from './TaskService';
 import { widenTaskContext } from './TaskContextWidening';
+import { unmetDependencies } from './TaskDependencies';
 import { collectCarriedFiles } from './RevisionCarryForward';
 import { VerificationService } from './VerificationService';
 import { AutomatedVerificationService, VERIFICATION_FAILED_EVENT, VERIFICATION_PASSED_EVENT, VERIFICATION_SKIPPED_EVENT } from './AutomatedVerificationService';
@@ -358,7 +359,8 @@ export class DesktopAutomationService {
       }
       if (this.settledForRevision(task) === 'FAILED') return status('FAILED', task.id, 'PROVIDER_EXECUTION_FAILED');
     }
-    const eligible = authorized.find((task) => this.isDispatchable(task));
+    const dependencyWait = first ? new Set<string>() : this.waitingOnDependencies(project);
+    const eligible = authorized.find((task) => !dependencyWait.has(task.id) && this.isDispatchable(task));
     if (!eligible) {
       // A concrete Manager state first, then what sent the task back, then a missing Manager agent.
       const waiting = this.managerWaitingReason(project);
@@ -370,6 +372,8 @@ export class DesktopAutomationService {
       if (failedVerification) return status('WAITING_FOR_MANAGER', failedVerification.id, 'VERIFICATION_FAILED');
       const sentBack = tasks.find((task) => task.state === 'CODING' && this.reviewer?.reviewReason(task) === 'REVIEW_FIX_REQUIRED');
       if (sentBack) return status('WAITING_FOR_MANAGER', sentBack.id, 'REVIEW_FIX_REQUIRED');
+      const held = tasks.find((task) => dependencyWait.has(task.id));
+      if (held) return status('WAITING_FOR_MANAGER', held.id, 'WAITING_FOR_DEPENDENCIES');
       return status('WAITING_FOR_MANAGER', waiting?.taskId ?? null, waiting?.reasonCode ?? null);
     }
     if (this.findCoderFor(eligible)) return status('QUEUED', eligible.id, this.isActive() ? null : 'AUTOMATION_STOPPED');
@@ -463,7 +467,30 @@ export class DesktopAutomationService {
       return first && first.state === 'CODING' && !running.has(first.id) && managerAuthorizesRevision(this.repo, first) && this.isDispatchable(first)
         ? first : null;
     }
-    return this.authorizedTasks(project).find((task) => !running.has(task.id) && this.isDispatchable(task)) ?? null;
+    const waiting = this.waitingOnDependencies(project);
+    return this.authorizedTasks(project).find((task) => !running.has(task.id) && !waiting.has(task.id) && this.isDispatchable(task)) ?? null;
+  }
+
+  /**
+   * Tasks whose dependencies are not finished, or with automatic integration not yet on the
+   * default branch, which every coder run starts from (#362). Their Manager is not asked
+   * before the dependencies finish; this also holds back authorized ones until integration.
+   */
+  private waitingOnDependencies(project: Project): Set<string> {
+    const autoIntegrate = this.repo.getProjectAutoIntegrate(project.id);
+    let entries: ReturnType<WorktreeIntegrationService['list']> | null = null;
+    const integrated = (taskId: string) => {
+      entries ??= this.integration.list(project.id);
+      const entry = entries.find((candidate) => candidate.taskId === taskId);
+      // No reviewed change to land, or the owner discarded it: nothing to wait for.
+      return !entry || entry.state === 'DISCARDED' || (entry.state === 'BRANCH_CREATED' && entry.mergedInto !== null);
+    };
+    const waiting = new Set<string>();
+    for (const task of this.repo.getTasksByProject(project.id)) {
+      if (task.state === 'DONE' || task.state === 'CANCELLED') continue;
+      if (unmetDependencies(this.repo, task, autoIntegrate ? integrated : undefined).length > 0) waiting.add(task.id);
+    }
+    return waiting;
   }
 
   /** One task at a time with automatic integration: the Manager plans for tasks that build on each other (#295). */
