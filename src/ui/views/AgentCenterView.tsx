@@ -3,12 +3,13 @@ import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { AgentCard } from '../components/AgentCard';
 import { AccessibleDialog } from '../components/AccessibleDialog';
+import { ConfirmPermanentDeleteDialog } from '../components/TrashPanel';
 import { useAgentRoster } from '../agentRoster';
 import { useAccountSignIn } from '../accountSignIn';
 import { SignInDialog } from '../components/SignInDialog';
 import { CliSignInDialog } from '../components/CliSignInDialog';
 import { ModelPicker } from '../components/ModelPicker';
-import type { AgentMutationResult } from '../agentRoster';
+import type { AgentMutationResult, AgentPurgeOutcome } from '../agentRoster';
 import type { AgentRole } from '../../core/types/domain';
 import type { AgentConnectionKind, AgentRosterEntry } from '../../core/types/workspace';
 import { MAX_AGENT_WORKER_SLOTS } from '../../core/types/workspace';
@@ -52,6 +53,8 @@ export const AgentCenterView: React.FC = () => {
   const [formError, setFormError] = useState<string | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<AgentRosterEntry | null>(null);
   const [removeError, setRemoveError] = useState<AgentMutationResult | null>(null);
+  const [confirmPurge, setConfirmPurge] = useState<AgentRosterEntry | null>(null);
+  const [purgeError, setPurgeError] = useState<AgentPurgeOutcome | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
   const [signInEntry, setSignInEntry] = useState<AgentRosterEntry | null>(null);
   const [cliSignInEntry, setCliSignInEntry] = useState<AgentRosterEntry | null>(null);
@@ -69,8 +72,21 @@ export const AgentCenterView: React.FC = () => {
     ];
   }, [roster.entries, t]);
 
-  const failureMessage = (result: AgentMutationResult) =>
+  const failureMessage = (result: AgentMutationResult | AgentPurgeOutcome) =>
     result.success ? '' : t(`agentCenter.errors.${result.code}`);
+
+  const failureAlert = (result: AgentMutationResult | AgentPurgeOutcome | null) => result && !result.success && (
+    <div role="alert" className="p-2.5 bg-rose-950/40 border border-rose-800/50 text-rose-300 rounded-lg text-xs space-y-1">
+      <div>{failureMessage(result)}</div>
+      {result.blockers.length > 0 && (
+        <ul className="list-disc pl-4">
+          {result.blockers.map((blocker) => (
+            <li key={`${blocker.code}-${blocker.reference}`}>{t(`agentCenter.blockers.${blocker.code}`, { reference: blocker.reference })}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 
   const openCreate = () => {
     setForm(emptyForm);
@@ -151,6 +167,18 @@ export const AgentCenterView: React.FC = () => {
     setNotice(result.success
       ? { tone: 'success', message: t('agentCenter.remove.restored', { name: result.agent.display_name }) }
       : { tone: 'error', message: failureMessage(result) });
+  };
+
+  const submitPurge = async () => {
+    if (!confirmPurge || roster.pending) return;
+    const result = await roster.purgeAgent(confirmPurge.agent.id);
+    if (result.success) {
+      setConfirmPurge(null);
+      setPurgeError(null);
+      setNotice({ tone: 'success', message: t('agentCenter.purge.purged', { name: confirmPurge.agent.display_name }) });
+    } else {
+      setPurgeError(result);
+    }
   };
 
   const editing = formMode?.kind === 'edit' ? formMode.entry : null;
@@ -250,6 +278,7 @@ export const AgentCenterView: React.FC = () => {
                   onEdit={() => openEdit(entry)}
                   onRemove={() => { setRemoveError(null); setConfirmRemove(entry); }}
                   onRestore={() => void restore(entry)}
+                  onPurge={() => { setPurgeError(null); setConfirmPurge(entry); }}
                   onSignIn={!entry.account ? undefined
                     : entry.connection === 'CODEX_CLI'
                       ? (signIn.available ? () => { setSignInEntry(entry); void signIn.start(entry.account!.id); } : undefined)
@@ -452,18 +481,7 @@ export const AgentCenterView: React.FC = () => {
               {t('agentCenter.remove.confirmTitle', { name: confirmRemove.agent.display_name })}
             </h3>
             <p id="agent-remove-body" className="text-sm text-slate-300">{t('agentCenter.remove.confirmBody')}</p>
-            {removeError && !removeError.success && (
-              <div role="alert" className="p-2.5 bg-rose-950/40 border border-rose-800/50 text-rose-300 rounded-lg text-xs space-y-1">
-                <div>{failureMessage(removeError)}</div>
-                {removeError.blockers.length > 0 && (
-                  <ul className="list-disc pl-4">
-                    {removeError.blockers.map((blocker) => (
-                      <li key={`${blocker.code}-${blocker.reference}`}>{t(`agentCenter.blockers.${blocker.code}`, { reference: blocker.reference })}</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )}
+            {failureAlert(removeError)}
             <div className="flex justify-end gap-3 pt-3 border-t border-surface-border">
               <button
                 type="button"
@@ -486,6 +504,19 @@ export const AgentCenterView: React.FC = () => {
             </div>
           </AccessibleDialog>
         </div>
+      )}
+
+      {confirmPurge && (
+        <ConfirmPermanentDeleteDialog
+          title={t('agentCenter.purge.confirmTitle', { name: confirmPurge.agent.display_name })}
+          body={t('agentCenter.purge.confirmBody')}
+          confirmLabel={t('agentCenter.purge.confirm')}
+          cancelLabel={t('agentCenter.purge.cancel')}
+          pending={roster.pending}
+          failure={failureAlert(purgeError)}
+          onCancel={() => setConfirmPurge(null)}
+          onConfirm={() => void submitPurge()}
+        />
       )}
     </div>
   );
