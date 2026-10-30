@@ -93,6 +93,7 @@ describe('capacity and capability truth', () => {
     expect(deriveConnectivityState({ isElectron: true, refreshError: 'offline' })).toBe('ERROR');
     expect(deriveConnectivityState({ isElectron: true, refreshError: null })).toBe('CONNECTING');
     expect(deriveConnectivityState({ isElectron: true, refreshError: null, hasRefreshed: true })).toBe('ONLINE');
-    expect(deriveConnectivityState({ isElectron: true, loading: true, hasRefreshed: true })).toBe('CONNECTING');
+    expect(deriveConnectivityState({ isElectron: true, loading: true, hasRefreshed: true })).toBe('ONLINE'); // A later poll (#358).
+    expect(deriveConnectivityState({ isElectron: true, loading: true })).toBe('CONNECTING');
   });
 });

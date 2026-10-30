@@ -123,7 +123,7 @@ export const ReviewedWorkPanel: React.FC<{ projectId: string }> = ({ projectId }
   };
 
   return (
-    <section aria-labelledby="reviewed-work-title" className="bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl space-y-4">
+    <section aria-labelledby="reviewed-work-title" className="h-full bg-surface-card border border-surface-border rounded-2xl p-6 shadow-xl space-y-4">
       <div>
         <h3 id="reviewed-work-title" className="text-base font-semibold text-white flex items-center gap-2.5">
           <GitBranch aria-hidden="true" className="w-5 h-5 text-forge-emerald" />
