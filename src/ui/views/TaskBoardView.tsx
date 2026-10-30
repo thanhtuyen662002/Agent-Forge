@@ -68,7 +68,8 @@ export const TaskBoardView: React.FC = () => {
     }).catch(() => undefined);
     void load();
     const handle = setInterval(() => { void load(); }, 15_000);
-    return () => { active = false; clearInterval(handle); };
+    const stop = () => { active = false; clearInterval(handle); };
+    return stop;
   }, [view, activeProject?.id, taskIds]);
   const visibleTasks = useMemo(
     () => tasks.filter((task) => matchesSearch(taskQuery, task.title, task.id, task.description)),
