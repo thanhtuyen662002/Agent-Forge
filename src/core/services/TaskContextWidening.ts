@@ -5,8 +5,11 @@ import { validateContextPaths } from '../protocol/planProtocol';
 
 /** At most this many repository files one failure names join the task's context at once (#328). */
 export const MAX_CONTEXT_ADDED_PER_FAILURE = 8;
-/** A repository-relative source, test or config file path, as test runners, coders and sync errors print it. */
-const CONTEXT_FILE_PATTERN = /(?<![\w./\\:-])((?:[\w.-]+[\\/])*[\w.-]+\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|json))(?![\w])/g;
+/**
+ * A repository-relative source, test, config or documentation file path, as test runners, coders and
+ * sync errors print it. Documentation counts (#349): a VidFlow coder blocked on a missing docs/PLAN.md.
+ */
+const CONTEXT_FILE_PATTERN = /(?<![\w./\\:-])((?:[\w.-]+[\\/])*[\w.-]+\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|json|md|yml|yaml|html|css|txt))(?![\w])/g;
 
 /**
  * A coder sees only its task's context paths (#328). In VidFlow M1 coders spent their
