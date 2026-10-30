@@ -137,6 +137,7 @@ export function captureAuthorizedTaskTransitionBinding(task: Task): AuthorizedTa
     expectedOwnershipEpoch: task.ownership_epoch ?? 1,
     expectedPausedFromState: task.paused_from_state,
     expectedMaxRevisions: task.max_revisions,
+    expectedUpdatedAt: task.updated_at,
   });
 }
 
@@ -226,6 +227,7 @@ export class TaskService {
       expectedOwnershipEpoch: expected.expectedOwnershipEpoch,
       expectedPausedFromState: expected.expectedPausedFromState,
       expectedMaxRevisions: expected.expectedMaxRevisions,
+      ...(typeof expected.expectedUpdatedAt === 'string' ? { expectedUpdatedAt: expected.expectedUpdatedAt } : {}),
     });
     try {
       const transition = TaskStateMachine.transition(binding.expectedState, trigger, {

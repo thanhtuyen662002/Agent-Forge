@@ -954,6 +954,13 @@ describe('desktop automation runtime', () => {
       await service.tick();
       await service.drain();
       expect(managerRequests).toHaveLength(2); // A fresh decision after the owner's retry.
+
+      // Blocked again in the same revision, the owner can clear it again (#368, VidFlow M8.6).
+      expect(repo.getTask(task.id)!.state).toBe('BLOCKED');
+      expect(tasks.retryTask(projectId, task.id)).toMatchObject({ success: true, task: { state: 'CODING', revision_count: 1 } });
+      await service.tick();
+      await service.drain();
+      expect(managerRequests).toHaveLength(3);
     }, 120_000);
 
     it('gives the Manager the owner note of a retry, for that revision only (#364)', async () => {
