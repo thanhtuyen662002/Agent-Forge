@@ -1,10 +1,11 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useOrchestrator } from '../context/OrchestratorContext';
 import { useI18n } from '../context/I18nContext';
 import { UiActionFailure, uiActionFailureKey } from '../actionState';
 import { ProgressIndicator } from '../components/ProgressIndicator';
 import { AccessibleDialog } from '../components/AccessibleDialog';
 import { ConfirmTrashDialog, TrashFailureMessage, TrashList } from '../components/TrashPanel';
+import { DependencyGraph } from '../components/DependencyGraph';
 import { matchesSearch, useWorkspaceTrash } from '../workspaceTrash';
 import type { TrashActionResult } from '../workspaceTrash';
 import type { Task } from '../../core/types/domain';
@@ -25,6 +26,8 @@ import {
   Clock,
   Search,
   Trash2,
+  Columns3,
+  Network,
 } from 'lucide-react';
 
 /** Matches the backend fence: only new, planned or finished tasks can be trashed. */
@@ -47,6 +50,27 @@ export const TaskBoardView: React.FC = () => {
   const [trashTarget, setTrashTarget] = useState<Task | null>(null);
   const [trashFailure, setTrashFailure] = useState<TrashActionResult | null>(null);
   const [trashNotice, setTrashNotice] = useState<{ ok: boolean; message: string; failure?: TrashActionResult } | null>(null);
+  // Board or dependency graph (#366); the graph reads every dependency of the project at once.
+  const [view, setView] = useState<'board' | 'graph'>('board');
+  const [dependencies, setDependencies] = useState<Record<string, string[]>>({});
+  const taskIds = tasks.map((task) => task.id).join(',');
+  useEffect(() => {
+    const api = typeof window !== 'undefined' ? (window as any).orchestrator ?? null : null;
+    if (view !== 'graph' || !activeProject || !api?.listTaskDependencies) return undefined;
+    let active = true;
+    const load = () => api.listTaskDependencies(activeProject.id).then((reply: any) => {
+      if (!active || !reply?.success || !reply.dependencies || typeof reply.dependencies !== 'object') return;
+      const clean: Record<string, string[]> = {};
+      for (const [taskId, ids] of Object.entries(reply.dependencies as Record<string, unknown>)) {
+        if (Array.isArray(ids)) clean[taskId] = ids.filter((id): id is string => typeof id === 'string');
+      }
+      setDependencies(clean);
+    }).catch(() => undefined);
+    void load();
+    const handle = setInterval(() => { void load(); }, 15_000);
+    const stop = () => { active = false; clearInterval(handle); };
+    return stop;
+  }, [view, activeProject?.id, taskIds]);
   const visibleTasks = useMemo(
     () => tasks.filter((task) => matchesSearch(taskQuery, task.title, task.id, task.description)),
     [tasks, taskQuery],
@@ -196,6 +220,20 @@ export const TaskBoardView: React.FC = () => {
           <span>{showTrash ? t('trash.hideTrash') : t('trash.showTrash')} ({projectTrash.tasks.length})</span>
         </button>
         {taskQuery.trim() && visibleTasks.length === 0 && <span className="text-xs text-slate-500">{t('trash.noMatches')}</span>}
+        <div role="group" aria-label={t('taskBoard.graph.viewLabel')} className="ml-auto flex rounded-lg border border-surface-border p-0.5">
+          {([['board', Columns3, t('taskBoard.graph.boardView')], ['graph', Network, t('taskBoard.graph.graphView')]] as const).map(([id, Icon, label]) => (
+            <button
+              key={id}
+              type="button"
+              aria-pressed={view === id}
+              onClick={() => setView(id)}
+              className={`px-3 py-1.5 rounded-md text-xs flex items-center gap-1.5 transition ${view === id ? 'bg-forge-cyan/15 text-forge-cyan font-semibold' : 'text-slate-400 hover:text-slate-200'}`}
+            >
+              <Icon className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>{label}</span>
+            </button>
+          ))}
+        </div>
       </div>
 
       {trashNotice && (trashNotice.ok
@@ -221,8 +259,18 @@ export const TaskBoardView: React.FC = () => {
         />
       )}
 
+      {view === 'graph' && (
+        <div className="flex-1 min-h-0 flex flex-col">
+          <DependencyGraph
+            tasks={visibleTasks}
+            dependencies={dependencies}
+            onOpenTask={(taskId) => { setSelectedTaskId(taskId); setActiveView('task-detail'); }}
+          />
+        </div>
+      )}
+
       {/* Kanban Board Columns Grid */}
-      <div className="flex gap-4 flex-1 min-h-0 overflow-x-auto pb-3">
+      {view === 'board' && <div className="flex gap-4 flex-1 min-h-0 overflow-x-auto pb-3">
         {columns.map((col) => {
           const colTasks = visibleTasks.filter((task) => getTaskLaneId(task.state) === col.id);
           return (
@@ -302,7 +350,7 @@ export const TaskBoardView: React.FC = () => {
             </div>
           );
         })}
-      </div>
+      </div>}
 
       {/* New Task Modal */}
       {isCreateModalOpen && (
