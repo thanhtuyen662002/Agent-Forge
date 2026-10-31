@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ensureProjectDependencies, MAX_VERIFICATION_ENV_ENTRIES, validateVerificationEnv } from '../src/core/services/ProjectVerificationEnvironment';
 
 /** #336: owner-set verification variables and locked dependencies beside the worktrees. */
@@ -45,6 +45,22 @@ describe('project verification environment', () => {
       runs = 0;
     });
     afterEach(() => fs.rmSync(managedRoot, { recursive: true, force: true }));
+
+    it('retries a move Windows briefly refuses, and reports a lasting refusal as a failed install (#370)', async () => {
+      const realRename = fs.renameSync.bind(fs);
+      let refusals = 0;
+      const spy = vi.spyOn(fs, 'renameSync').mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+        if (String(to).endsWith('node_modules') && refusals < 2) { refusals += 1; throw Object.assign(new Error('busy'), { code: 'EBUSY' }); }
+        return realRename(from, to);
+      }) as typeof fs.renameSync);
+      expect(await install()).toMatchObject({ status: 'INSTALLED' });
+      expect(refusals).toBe(2);
+
+      spy.mockImplementation((() => { throw Object.assign(new Error('busy'), { code: 'EBUSY' }); }) as typeof fs.renameSync);
+      fs.writeFileSync(path.join(worktree, 'package-lock.json'), '{"lockfileVersion":3,"packages":{"":{}}}');
+      expect(await install()).toMatchObject({ status: 'FAILED', reasonCode: 'DEPENDENCY_INSTALL_EBUSY' });
+      spy.mockRestore();
+    }, 30_000);
 
     it('installs once per lockfile beside the worktrees, where a worktree resolves it', async () => {
       expect(await install()).toMatchObject({ status: 'INSTALLED' });

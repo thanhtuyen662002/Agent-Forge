@@ -83,6 +83,23 @@ export async function ensureProjectDependencies(worktree: string, env: Record<st
 
 const installsInFlight = new Map<string, Promise<DependencyInstallResult>>();
 
+/**
+ * Windows briefly locks a freshly written tree (antivirus, indexer): moving or removing it
+ * then fails with EBUSY or EPERM (Phiếu Lương, #370). Such a step is retried for a few
+ * seconds before it fails.
+ */
+async function withBusyRetry<T>(step: () => T, attempts = 8, delayMs = 500): Promise<T> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return step();
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (attempt >= attempts || (code !== 'EBUSY' && code !== 'EPERM' && code !== 'ENOTEMPTY')) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 async function installOnce(worktree: string, env: Record<string, string>,
   options: InstallOptions): Promise<DependencyInstallResult> {
   const lockPath = path.join(worktree, 'package-lock.json');
@@ -98,7 +115,7 @@ async function installOnce(worktree: string, env: Record<string, string>,
   if (fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').trim() === lockSha256) return { status: 'CURRENT', lockSha256 };
 
   const staging = path.join(managedRoot, `.agent-forge-deps-${lockSha256.slice(0, 16)}`);
-  fs.rmSync(staging, { recursive: true, force: true });
+  await withBusyRetry(() => fs.rmSync(staging, { recursive: true, force: true }));
   fs.mkdirSync(staging, { recursive: true });
   fs.copyFileSync(manifestPath, path.join(staging, 'package.json'));
   fs.copyFileSync(lockPath, path.join(staging, 'package-lock.json'));
@@ -114,13 +131,20 @@ async function installOnce(worktree: string, env: Record<string, string>,
   // A project without dependencies installs nothing; an empty tree is still current.
   if (result.exitCode === 0 && !fs.existsSync(installed)) fs.mkdirSync(installed);
   if (result.exitCode !== 0) {
-    fs.rmSync(staging, { recursive: true, force: true });
+    await withBusyRetry(() => fs.rmSync(staging, { recursive: true, force: true }));
     return { status: 'FAILED', reasonCode: result.timedOut ? 'DEPENDENCY_INSTALL_TIMEOUT' : 'DEPENDENCY_INSTALL_FAILED', lockSha256 };
   }
-  // A previous tree is replaced only after the new one installed completely.
-  fs.rmSync(target, { recursive: true, force: true });
-  fs.renameSync(installed, target);
+  // A previous tree is replaced only after the new one installed completely. A move that
+  // still fails after the retries is a failed install (retried later), never a thrown error.
+  try {
+    await withBusyRetry(() => fs.rmSync(target, { recursive: true, force: true }));
+    await withBusyRetry(() => fs.renameSync(installed, target));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    try { fs.rmSync(staging, { recursive: true, force: true }); } catch { /* Cleaned on the next install. */ }
+    return { status: 'FAILED', reasonCode: `DEPENDENCY_INSTALL_${typeof code === 'string' && /^[A-Z]+$/.test(code) ? code : 'MOVE_FAILED'}`, lockSha256 };
+  }
   fs.writeFileSync(marker, lockSha256, 'utf8');
-  fs.rmSync(staging, { recursive: true, force: true });
+  await withBusyRetry(() => fs.rmSync(staging, { recursive: true, force: true })).catch(() => undefined);
   return { status: 'INSTALLED', lockSha256 };
 }
