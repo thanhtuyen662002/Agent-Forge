@@ -9,6 +9,8 @@ import { ProjectStopFenceService } from './ProjectStopFenceService';
 import { WorkerSlotLeaseService } from './WorkerSlotLeaseService';
 import { EvidenceCollector } from '../autonomy/evidence';
 import { parseReviewProtocol } from '../protocol/reviewProtocol';
+import { LOCAL_CLI_WORKSPACE_MAX_FILES, LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_ENTRIES } from '../adapters/LocalCliAdapterBase';
+import { reviewContextFiles } from './ReviewContext';
 import { createProductLeaseRecoveryMarkerEvent, createProductLeaseRecoveryResolvedEvent } from './ProductLeaseRecoveryScanner';
 import type { WorkOrder } from '../autonomy/contracts';
 import type { AgentExecutionResult, RuntimeExecutionBinding } from '../adapters/ProviderAdapter';
@@ -243,6 +245,9 @@ export class ProductReviewService {
       contextFiles = JSON.parse(auth.canonical_payload_json ?? '{}').contextFiles;
       if (!Array.isArray(contextFiles) || contextFiles.length === 0) throw new Error('missing');
     } catch { return terminal(REVIEW_STALE_EVENT, 'EXECUTION_SCOPE_INVALID'); }
+    contextFiles = reviewContextFiles(work.worktree, contextFiles, before.changedFiles, {
+      maxFiles: LOCAL_CLI_WORKSPACE_MAX_FILES, maxTraversalEntries: LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_ENTRIES,
+    });
 
     // 2. A RUNNING review attempt, routed to the reviewer's own account.
     const attemptId = `attempt-${crypto.randomUUID()}`;
