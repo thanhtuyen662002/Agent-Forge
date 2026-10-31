@@ -56,6 +56,21 @@ describe('task context widening', () => {
     expect(context).toEqual(['src/paths.ts', 'electron', 'renderer/App.tsx', ...added]);
   });
 
+  it('resolves extensionless relative imports from the files and folders in context (#372)', () => {
+    write('src/core/salary.ts');
+    write('src/core/insurance.ts');
+    write('src/core/tax.ts');
+    write('src/core/params/index.ts');
+    write('src/components/Breakdown.astro');
+    context = ['src/core/salary.ts', 'src/components'];
+    const added = widenTaskContext(repo(), 'P', 'T', [
+      'salary.ts import ./insurance, ./tax và ./params nhưng các module này không có trong workspace; ./missing cũng vậy',
+      'Breakdown.astro trong src/components/Breakdown.astro',
+    ]);
+    // Astro components are recognized by name too.
+    expect(added).toEqual(['src/core/insurance.ts', 'src/core/tax.ts', 'src/core/params/index.ts', 'src/components/Breakdown.astro']);
+  });
+
   it('never adds paths outside the repository, dependencies, or anything for a task without explicit context', () => {
     write('node_modules/pkg/index.js');
     expect(widenTaskContext(repo(), 'P', 'T', ['../outside.ts', 'node_modules/pkg/index.js', '.git/config.json'])).toEqual([]);
