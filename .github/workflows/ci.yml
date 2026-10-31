@@ -62,7 +62,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Setup Node.js 22.x
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22.x'
           cache: 'npm'
@@ -82,7 +82,7 @@ jobs:
         run: npm test -- --shard=${{ matrix.shard }}/4
 
       - name: Upload bounded public shard timing
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agentforge-windows-profile-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
           path: node_modules/.cache/agentforge-windows-profile/shard-${{ matrix.shard }}.json
@@ -137,7 +137,7 @@ jobs:
 
       - name: Setup Node.js ${{ matrix.node-version }}
         if: needs.classify.outputs.package_required == 'true'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
@@ -201,7 +201,7 @@ jobs:
 
       - name: Setup Node.js 22.x
         if: needs.classify.outputs.package_required == 'true'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22.x'
           cache: 'npm'
@@ -212,7 +212,7 @@ jobs:
 
       - name: Download public shard timing
         if: needs.classify.outputs.package_required == 'true'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: agentforge-windows-profile-${{ github.run_id }}-*
           path: node_modules/.cache/agentforge-windows-profile/incoming
@@ -230,7 +230,7 @@ jobs:
 
       - name: Upload complete public timing profile
         if: needs.classify.outputs.package_required == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agentforge-windows-timing-${{ github.run_id }}-${{ github.run_attempt }}
           path: node_modules/.cache/agentforge-windows-profile/combined.json
@@ -292,7 +292,7 @@ jobs:
 
       - name: Setup Node.js 22.x
         if: needs.classify.outputs.package_required == 'true'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22.x'
           cache: 'npm'
@@ -342,7 +342,7 @@ jobs:
 
       - name: Upload Windows Installed Update Test Diagnostics
         if: always() && needs.classify.outputs.package_required == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agentforge-installed-update-diagnostics-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           path: release/installed-update-test/diagnostics/
@@ -395,7 +395,7 @@ jobs:
 
       - name: Upload Windows Installer Artifact
         if: needs.classify.outputs.package_required == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agentforge-windows-installer-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           path: |
