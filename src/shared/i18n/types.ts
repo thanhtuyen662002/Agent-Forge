@@ -231,6 +231,7 @@ export interface TranslationDictionary {
     retryButton: string;
     retryFailed: string;
     retryCoderHint: string;
+    retryReviewHint: string;
     retryCoderButton: string;
     retryBlockedHint: string;
     noTaskSelected: string;

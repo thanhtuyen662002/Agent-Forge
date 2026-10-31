@@ -42,13 +42,13 @@ export function getLocalCliWorkspaceBase(): string {
 }
 const LOCAL_CLI_WORKSPACE_MARKER_SUFFIX = '.workspace.json';
 const LOCAL_CLI_WORKSPACE_STALE_AFTER_MS = 6 * 60 * 60 * 1000;
-const LOCAL_CLI_WORKSPACE_MAX_FILES = 256;
+export const LOCAL_CLI_WORKSPACE_MAX_FILES = 256;
 const LOCAL_CLI_WORKSPACE_MAX_BYTES = 16 * 1024 * 1024;
 const LOCAL_CLI_FILE_MAX_BYTES = 4 * 1024 * 1024;
 // Directory context is provider-controlled input. Bound both the number of
 // directory entries inspected and the nesting depth before materializing any
 // workspace files so a hostile tree cannot exhaust memory or recursion depth.
-const LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_ENTRIES = 512;
+export const LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_ENTRIES = 512;
 const LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_DEPTH = 128;
 const LOCAL_CLI_WORKSPACE_MAX_CONTEXT_PATHS = 128;
 /** Bounds on what a provider may add inside its authorized directories (#240). */

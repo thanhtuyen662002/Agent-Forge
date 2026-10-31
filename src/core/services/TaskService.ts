@@ -338,6 +338,9 @@ export class TaskService {
    *   stop it silently): coder failures settled before the retry stop counting.
    * - BLOCKED (the Manager stopped it, for example because the coder lacked files,
    *   #328): CLEAR_BLOCKED returns it to CODING, and the Manager is asked again.
+   * - REVIEWING with no attempt running (its reviews ended without a verdict too
+   *   often, #374): review failures before the retry stop counting, so the same
+   *   verified work is reviewed again.
    */
   public retryTask(projectId: string, taskId: string, extraRevisions = OWNER_RETRY_EXTRA_REVISIONS, note?: string | null):
     { success: true; task: Task } | { success: false; errorCode: string; error: string } {
@@ -373,6 +376,16 @@ export class TaskService {
             `The owner retried blocked task ${taskId} at revision ${task.revision_count}; the Manager decides again.`,
             withNote({ taskId, revision: task.revision_count, maxRevisions: task.max_revisions }), taskId);
           return { success: true as const, task: this.repo.getTask(taskId)! };
+        }
+        if (task.state === 'REVIEWING') {
+          // Reviews that ended without a verdict ran out (#374); earlier review failures stop counting.
+          if (this.repo.getTaskAttemptsByTask(taskId).some((attempt) => attempt.status === 'RUNNING')) {
+            throw new OwnerRetryError('TASK_NOT_RETRYABLE');
+          }
+          this.eventService.record(projectId, OWNER_TASK_RETRIED_EVENT,
+            `The owner retried the review of task ${taskId} at revision ${task.revision_count}; earlier review failures no longer count.`,
+            withNote({ taskId, revision: task.revision_count, maxRevisions: task.max_revisions, review: true }), taskId);
+          return { success: true as const, task };
         }
         if (task.state !== 'NEEDS_HUMAN') throw new OwnerRetryError('TASK_NOT_RETRYABLE');
         const maxRevisions = task.revision_count + extraRevisions;

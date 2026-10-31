@@ -799,6 +799,16 @@ describe('desktop automation runtime', () => {
       expect(reviewRequests).toHaveLength(3);
       expect(eventsOf('AUTOMATION_REVIEW_FAILED')).toHaveLength(3);
       expect(repo.getTask(task.id)).toMatchObject({ state: 'REVIEWING', revision_count: task.revision_count });
+
+      // The owner retries the review (#374): earlier failures stop counting and the same work is reviewed again.
+      expect(tasks.retryTask(projectId, task.id)).toMatchObject({ success: true, task: { state: 'REVIEWING' } });
+      reviewReply = verdict('PASS');
+      clock += 61_000;
+      await service.tick();
+      await service.drain();
+      expect(reviewRequests).toHaveLength(4);
+      expect(repo.getTask(task.id)).toMatchObject({ state: 'DONE', revision_count: task.revision_count });
+      expect(adapterCalls).toBe(1); // The coder was not run again.
     }, 180_000);
 
     it('releases a task left in REVIEWING by a BLOCKED verdict from before #308 (#310)', async () => {

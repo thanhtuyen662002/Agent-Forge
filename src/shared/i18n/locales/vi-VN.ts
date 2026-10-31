@@ -228,6 +228,7 @@ export const viVN: TranslationDictionary = {
     retryButton: 'Chạy lại, thêm {count} lần sửa',
     retryFailed: 'Không chạy lại được task ({code}).',
     retryCoderHint: 'Các lượt chạy của coder ở lần sửa này đều hỏng nên tự động hóa đã ngừng thử. Chạy lại để coder thử tiếp.',
+    retryReviewHint: 'Các lượt soát phần việc đã kiểm tra này đều kết thúc mà không có kết luận. Chạy lại để soát lại đúng phần việc đó.',
     retryCoderButton: 'Cho coder chạy lại',
     retryBlockedHint: "Manager đã dừng task này. Chạy lại để Manager quyết định lại; các file mà lỗi nhắc tới đã được thêm vào phạm vi của task.",
     noTaskSelected: 'Chưa chọn nhiệm vụ nào. Quay lại Bảng Nhiệm vụ.',

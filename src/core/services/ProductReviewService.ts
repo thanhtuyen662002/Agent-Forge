@@ -3,12 +3,14 @@ import { Repository } from '../database/repositories';
 import { EventService } from './EventService';
 import { ProviderRegistry } from '../adapters/ProviderRegistry';
 import { RoleAwareRoutingService } from './RoleAwareRoutingService';
-import { TaskService, captureAuthorizedTaskTransitionBinding } from './TaskService';
+import { TaskService, captureAuthorizedTaskTransitionBinding, OWNER_TASK_RETRIED_EVENT } from './TaskService';
 import { GitWorktreeService } from './GitWorktreeService';
 import { ProjectStopFenceService } from './ProjectStopFenceService';
 import { WorkerSlotLeaseService } from './WorkerSlotLeaseService';
 import { EvidenceCollector } from '../autonomy/evidence';
 import { parseReviewProtocol } from '../protocol/reviewProtocol';
+import { LOCAL_CLI_WORKSPACE_MAX_FILES, LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_ENTRIES } from '../adapters/LocalCliAdapterBase';
+import { reviewContextFiles } from './ReviewContext';
 import { createProductLeaseRecoveryMarkerEvent, createProductLeaseRecoveryResolvedEvent } from './ProductLeaseRecoveryScanner';
 import type { WorkOrder } from '../autonomy/contracts';
 import type { AgentExecutionResult, RuntimeExecutionBinding } from '../adapters/ProviderAdapter';
@@ -115,6 +117,21 @@ export class ProductReviewService {
     return this.repo.getProjectEventsOfTypes(projectId, [REVIEW_STARTED_EVENT, ...REVIEW_TERMINAL_EVENTS]);
   }
 
+  /** When the owner last retried each task; review failures before it no longer count (#374). */
+  private ownerRetries(projectId: string): Map<string, string> {
+    const latest = new Map<string, string>();
+    for (const event of this.repo.getProjectEventsOfTypes(projectId, [OWNER_TASK_RETRIED_EVENT])) {
+      if (event.task_id && event.timestamp > (latest.get(event.task_id) ?? '')) latest.set(event.task_id, event.timestamp);
+    }
+    return latest;
+  }
+
+  /** A review that ended without a verdict and still counts against MAX_REVIEW_RETRIES. */
+  private countedFailure(event: { type: string; task_id?: string | null; timestamp: string }, retries: Map<string, string>): boolean {
+    return (event.type === REVIEW_FAILED_EVENT || event.type === REVIEW_INTERRUPTED_EVENT) &&
+      event.timestamp > (retries.get(event.task_id ?? '') ?? '');
+  }
+
   /** The verified work a review of this task would be bound to, or null. */
   public verifiedWork(task: Task): VerifiedWork | null {
     if (this.repo.isTaskTrashed(task.id)) return null;
@@ -148,7 +165,8 @@ export class ProductReviewService {
     const payload = (latest.structured_payload ?? {}) as { reasonCode?: unknown; verificationEventId?: unknown };
     if (typeof payload.reasonCode === 'string' && NOT_RETRYABLE_REVIEW_FAILURES.has(payload.reasonCode)) return false;
     if (Date.parse(latest.timestamp) + REVIEW_REQUEUE_AFTER_MS > this.now().getTime()) return false;
-    const failures = own.filter((event) => (event.type === REVIEW_FAILED_EVENT || event.type === REVIEW_INTERRUPTED_EVENT) &&
+    const retries = this.ownerRetries(task.project_id);
+    const failures = own.filter((event) => this.countedFailure(event, retries) &&
       (event.structured_payload as { verificationEventId?: unknown } | null)?.verificationEventId === payload.verificationEventId).length;
     if (failures >= MAX_REVIEW_RETRIES) return false;
     return !this.repo.getTaskAttemptsByTask(task.id).some((attempt) => attempt.status === 'RUNNING' && attempt.summary === REVIEW_ATTEMPT_MARKER);
@@ -164,12 +182,13 @@ export class ProductReviewService {
     // ended without one, the same work is offered again (#356, see reviewRetryDue)
     // until MAX_REVIEW_RETRIES reviews of it have failed.
     const events = this.reviewEvents(projectId);
+    const retries = this.ownerRetries(projectId);
     const consumed = new Set<unknown>();
     const failures = new Map<unknown, number>();
     for (const event of events) {
       const verification = (event.structured_payload as { verificationEventId?: unknown } | null)?.verificationEventId;
       if (event.type === REVIEW_STALE_EVENT || REVIEW_VERDICT_EVENTS.includes(event.type)) consumed.add(verification);
-      if (event.type === REVIEW_FAILED_EVENT || event.type === REVIEW_INTERRUPTED_EVENT) {
+      if (this.countedFailure(event, retries)) {
         failures.set(verification, (failures.get(verification) ?? 0) + 1);
         if ((failures.get(verification) ?? 0) >= MAX_REVIEW_RETRIES) consumed.add(verification);
       }
@@ -243,6 +262,9 @@ export class ProductReviewService {
       contextFiles = JSON.parse(auth.canonical_payload_json ?? '{}').contextFiles;
       if (!Array.isArray(contextFiles) || contextFiles.length === 0) throw new Error('missing');
     } catch { return terminal(REVIEW_STALE_EVENT, 'EXECUTION_SCOPE_INVALID'); }
+    contextFiles = reviewContextFiles(work.worktree, contextFiles, before.changedFiles, {
+      maxFiles: LOCAL_CLI_WORKSPACE_MAX_FILES, maxTraversalEntries: LOCAL_CLI_WORKSPACE_MAX_TRAVERSAL_ENTRIES,
+    });
 
     // 2. A RUNNING review attempt, routed to the reviewer's own account.
     const attemptId = `attempt-${crypto.randomUUID()}`;
