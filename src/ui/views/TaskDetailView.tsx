@@ -73,8 +73,11 @@ export const TaskDetailView: React.FC = () => {
   }
 
   // NEEDS_HUMAN, or a coding task automation reports as failed: its coder retries ran out (#318).
-  const retryable = task.state === 'NEEDS_HUMAN' || task.state === 'BLOCKED' || (task.state === 'CODING' && (automationStatus?.projects ?? [])
-    .some((entry) => entry.projectId === task.project_id && entry.taskId === task.id && entry.phase === 'FAILED'));
+  // A review that keeps ending without a verdict can be retried as well (#374).
+  const automationEntry = (automationStatus?.projects ?? []).find((entry) => entry.projectId === task.project_id && entry.taskId === task.id);
+  const reviewRetryable = task.state === 'REVIEWING' && automationEntry?.reasonCode === 'REVIEW_FAILED';
+  const retryable = task.state === 'NEEDS_HUMAN' || task.state === 'BLOCKED' || reviewRetryable ||
+    (task.state === 'CODING' && automationEntry?.phase === 'FAILED');
 
   const handleRetry = async () => {
     const api = typeof window !== 'undefined' ? (window as any).orchestrator ?? null : null;
@@ -146,7 +149,7 @@ export const TaskDetailView: React.FC = () => {
               <AlertTriangle className="w-4 h-4" />
               <span>{t('taskDetail.retryTitle')}</span>
             </h3>
-            <p className="text-xs text-slate-300">{task.state === 'NEEDS_HUMAN' ? t('taskDetail.retryHint', { count: OWNER_RETRY_REVISIONS }) : task.state === 'BLOCKED' ? t('taskDetail.retryBlockedHint') : t('taskDetail.retryCoderHint')}</p>
+            <p className="text-xs text-slate-300">{task.state === 'NEEDS_HUMAN' ? t('taskDetail.retryHint', { count: OWNER_RETRY_REVISIONS }) : task.state === 'BLOCKED' ? t('taskDetail.retryBlockedHint') : reviewRetryable ? t('taskDetail.retryReviewHint') : t('taskDetail.retryCoderHint')}</p>
             {retryError && <p role="alert" className="text-xs text-red-300">{t('taskDetail.retryFailed', { code: retryError })}</p>}
             {/* What the owner changed or decided; the Manager reads it before deciding (#364). */}
             <label className="block pt-2 text-xs text-slate-300">
